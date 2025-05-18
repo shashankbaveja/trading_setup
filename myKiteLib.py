@@ -54,11 +54,11 @@ class system_initialization:
     
     
     def init_trading(self):
+        self.kite.set_access_token(self.AccessToken)
         try:
             data = self.kite.historical_data(256265,'2025-05-15','2025-05-15','minute')
-            print(data)
         except KiteException as e:
-            print(KiteException)
+            print(e)
             print("Access token expired, Generating new token")
             temp_token = self.kite_chrome_login_generate_temp_token()
             AccessToken = self.kite.generate_session(temp_token, api_secret= self.api_secret)["access_token"]
@@ -233,8 +233,8 @@ class kiteAPIs:
         self.con.close()
         return df['instrument_token'].values.astype(int).tolist()
     
-    def get_instrument_active_tokens(self, instrument_type, start_dt):
-        query = f"SELECT instrument_token FROM kiteConnect.instruments_zerodha where expiry >= '{start_dt}' and instrument_type = '{instrument_type}'".format(instrument_type, start_dt)
+    def get_instrument_active_tokens(self, instrument_type, end_dt_backfill):
+        query = f"SELECT instrument_token FROM kiteConnect.instruments_zerodha where expiry >= '{end_dt_backfill}' and instrument_type = '{instrument_type}'".format(instrument_type, end_dt_backfill)
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         df = pd.read_sql(query, self.con)
         self.con.close()
@@ -352,65 +352,82 @@ class kiteAPIs:
             print('Invalid symbol provided')
             return 'None'
         
-        df = pd.DataFrame()
-
         i = 0
 
         token_exceptions = []
         for t in tokens:
             print(t)
             try:
+                df = pd.DataFrame()
                 records = self.kite.historical_data(t, from_date=from_date, to_date=to_date, interval=interval)
                 if len(records) > 0:
                     records = pd.DataFrame(records)
                     records['instrument_token'] = t
                     df = pd.concat([df, records], axis = 0)
+                    df['interval'] = interval
+                    df['id'] = df['instrument_token'].astype(str) + '_' + df['interval'] + '_' + df['date'].dt.strftime("%Y%m%d%H%M")
+                
+                    self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
+    # Ensure 'date' column is pandas Timestamp for intermediate operations if not already
+                    if not pd.api.types.is_datetime64_any_dtype(df['date']):
+                        df['date'] = pd.to_datetime(df['date'])
+
+                    # Convert pandas Timestamp to string in 'YYYY-MM-DD HH:MM:SS' format for DB insertion
+                    # This matches how it would likely be formatted implicitly in row-by-row string insertion
+                    df['date_for_db'] = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Prepare data for executemany: list of tuples
+                    # Column order matches the VALUES clause: id, instrument_token, date_for_db (string for timestamp col), open, high, low, close, volume
+                    try:
+                        data_to_insert = list(df[['id', 'instrument_token', 'date_for_db', 'open', 'high', 'low', 'close', 'volume']].itertuples(index=False, name=None))
+                    except KeyError as ke:
+                        print(f"DataFrame missing expected columns for DB insertion: {ke}. Columns available: {df.columns.tolist()}")
+                        data_to_insert = [] 
+
+                    target_table_name = None
+                    if interval == 'minute':
+                        target_table_name = "kiteConnect.historical_data_minute"
+                    elif interval == 'day':
+                        target_table_name = "kiteConnect.historical_data_day"
+                    
+
+                    if target_table_name and data_to_insert:
+                        cur = None # Initialize cur to None
+                        try:
+                            cur = self.con.cursor()
+                            # Using %s placeholders for values in the query
+                            query = f"INSERT IGNORE INTO {target_table_name} (id, instrument_token, timestamp, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                            # Assuming your table columns are named: id, instrument_token, timestamp (for date), open, high, low, close, volume
+                            # If your table does not explicitly name columns in this order, adjust the query or ensure table was created with this order.
+                            # For safety, it's best if INSERT specifies column names, like above.
+                            # If you must stick to the original schemaless insert:
+                            # query = f"INSERT IGNORE INTO {target_table_name} VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+
+
+                            print(f"Attempting to bulk insert {len(data_to_insert)} records into {target_table_name}...")
+                            cur.executemany(query, data_to_insert)
+                            self.con.commit()
+                            print(f"Bulk insert/ignore completed for {target_table_name}. Rows affected: {cur.rowcount}")
+                        except Exception as e: # Catch potential errors during DB operation
+                            print(f"Error during bulk insert into {target_table_name}: {e}")
+                            # Consider self.con.rollback() if an error occurs and transactions are being used explicitly
+                        finally:
+                            if cur:
+                                cur.close() # Close cursor
+                                self.con.close()
+                    elif not data_to_insert:
+                        print(f"No data prepared for insertion for interval {interval} (data_to_insert list is empty).")
+                    else:
+                        print(f"Unsupported interval '{interval}' or no table determined for database insertion.")
+                else:
+                    print("DataFrame is empty, skipping database insertion.")
+                    
             except KiteException as e:
                 print(f"KiteConnect API error for token {t}: {str(e)}")
                 token_exceptions.append(t)
                 continue
             
-        print(df.head())
-        df['interval'] = interval
-        df['id'] = df['instrument_token'].astype(str) + '_' + df['interval'] + '_' + df['date'].dt.strftime("%Y%m%d%H%M")
-        
-        self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
-
-        i = 0
-        if interval == 'minute':
-            for i in range (0, len(df)):
-                query = "insert ignore into kiteConnect.historical_data_minute values('{}',{},'{}',{},{},{},{},{})".format(df['id'].iloc[i],df['instrument_token'].iloc[i],df['date'].iloc[i],df['open'].iloc[i],df['high'].iloc[i],df['low'].iloc[i],df['close'].iloc[i],df['volume'].iloc[i])
-                print(i)
-                cur = self.con.cursor()
-                cur.execute(query)
-                self.con.commit()
-                # print("saved token to DB")
-        elif interval == 'day':
-            for i in range (0, len(df)):
-                query = "insert ignore into kiteConnect.historical_data_day values('{}',{},'{}',{},{},{},{},{})".format(df['id'].iloc[i],df['instrument_token'].iloc[i],df['date'].iloc[i],df['open'].iloc[i],df['high'].iloc[i],df['low'].iloc[i],df['close'].iloc[i],df['volume'].iloc[i])
-                print(i)
-                cur = self.con.cursor()
-                cur.execute(query)
-                self.con.commit()
-                # print("saved token to DB")
-        elif interval == '5minute':
-            for i in range (0, len(df)):
-                query = "insert ignore into kiteConnect.historical_data_5minute values('{}',{},'{}',{},{},{},{},{})".format(df['id'].iloc[i],df['instrument_token'].iloc[i],df['date'].iloc[i],df['open'].iloc[i],df['high'].iloc[i],df['low'].iloc[i],df['close'].iloc[i],df['volume'].iloc[i])
-                print(i)
-                cur = self.con.cursor()
-                cur.execute(query)
-                self.con.commit()
-                # print("saved token to DB")
-        elif interval == '2minute':
-            for i in range (0, len(df)):
-                query = "insert ignore into kiteConnect.historical_data_2minute values('{}',{},'{}',{},{},{},{},{})".format(df['id'].iloc[i],df['instrument_token'].iloc[i],df['date'].iloc[i],df['open'].iloc[i],df['high'].iloc[i],df['low'].iloc[i],df['close'].iloc[i],df['volume'].iloc[i])
-                print(i)
-                cur = self.con.cursor()
-                cur.execute(query)
-                self.con.commit()
-                # print("saved token to DB")
-            
-        self.con.close()
+       
         print('token_exceptions: ',token_exceptions)
         return df
         

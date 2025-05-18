@@ -1,0 +1,13 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+I want you to behave like an expert trader who specializes in intraday options trading.
+My objective is to build a model to predict short term reversals in the market and take advantage of the same. Short term means 5-10 minute window
+We will primarily look at NIFTY50 Index and trade options for it. INDEX NIFTY 50 instrument token = 256265
+
+I want to look at movements (downtrend reversal) in the index and accordingly but call options with clear target price and stop loss. 
+I want to build multiple strategies with a lot of technical indicators and predict that reversal on the index and simulate the trading on the option. 
+
+

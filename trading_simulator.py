@@ -38,7 +38,8 @@ class TradingSimulator:
                  option_type: str,          
                  trade_interval: str,       
                  trade_params: dict,        # e.g., {'units': ..., 'profit_target_pct': ..., etc.}
-                 initial_capital: float     # Typically from [SIMULATOR_SETTINGS]
+                 initial_capital: float,    # Typically from [SIMULATOR_SETTINGS]
+                 allow_concurrent_trades: bool # From [SIMULATOR_SETTINGS]
                  ):
         
         self.index_token = index_token
@@ -54,6 +55,10 @@ class TradingSimulator:
         self.trade_params = trade_params 
         if not all(k in self.trade_params for k in ['units', 'profit_target_pct', 'stop_loss_pct', 'max_holding_period_minutes']):
             raise ValueError("trade_params dict is missing one or more required keys: units, profit_target_pct, stop_loss_pct, max_holding_period_minutes")
+
+        self.allow_concurrent_trades = allow_concurrent_trades
+        self.is_trade_active = False 
+        print(f"TradingSimulator: allow_concurrent_trades set to: {self.allow_concurrent_trades}")
 
         self.data_prep = DataPrep()
         if not self.data_prep.k_apis:
@@ -281,6 +286,8 @@ class TradingSimulator:
     def run_simulation(self):
         print("\n--- Starting Trading Simulation ---")
         self.executed_trades = [] 
+        self.is_trade_active = False # Ensure it's reset at the start of a new simulation run
+        current_active_trade_exit_time = None # NEW: To track the exit time of the current trade
 
         print(f"Fetching NIFTY 50 index data ({self.index_token})...")
         # trade_interval now comes from the strategy's config, passed to __init__
@@ -330,7 +337,19 @@ class TradingSimulator:
             nifty_signal_time = signal_row['date']
             nifty_price_at_signal = signal_row['close'] 
 
-            print(f"\nProcessing BUY signal on NIFTY at {nifty_signal_time}, NIFTY Price: {nifty_price_at_signal:.2f}")
+            # NEW: Check if a current trade is active and if its exit time has passed
+            if self.is_trade_active and current_active_trade_exit_time is not None:
+                if nifty_signal_time >= current_active_trade_exit_time:
+                    print(f"  LOG_CONCURRENCY: Previous trade ended at {current_active_trade_exit_time}. Setting is_trade_active = False for signal at {nifty_signal_time}.")
+                    self.is_trade_active = False
+                    current_active_trade_exit_time = None
+                # else: The current nifty_signal_time is still within the previous trade's duration.
+
+            print(f"\nProcessing BUY signal on NIFTY at {nifty_signal_time}, NIFTY Price: {nifty_price_at_signal:.2f}. Current is_trade_active: {self.is_trade_active}")
+
+            if not self.allow_concurrent_trades and self.is_trade_active:
+                print(f"  LOG_CONCURRENCY: Skipping NIFTY BUY signal at {nifty_signal_time} because a trade is still active until {current_active_trade_exit_time} and concurrent_signal_trade is False.")
+                continue
 
             option_token = None
             # self.option_type is set during __init__ from strategy config
@@ -342,6 +361,9 @@ class TradingSimulator:
                 print(f"  Unsupported option type: {self.option_type}. Skipping option search.")
 
             if option_token:
+                # print(f"  LOG_CONCURRENCY: Setting is_trade_active = True for NIFTY signal at {nifty_signal_time}") # Old log, will be replaced
+                # self.is_trade_active = True # Old logic, moved and made conditional
+                
                 # Fetch option data
                 option_data_start_date = nifty_signal_time.date()
                 # Set option_data_end_date to the overall simulation end date
@@ -381,8 +403,18 @@ class TradingSimulator:
                     )
                     if trade_log:
                         self.executed_trades.append(trade_log)
+                        if not self.allow_concurrent_trades: # NEW: Only manage active state if non-concurrent
+                            self.is_trade_active = True
+                            current_active_trade_exit_time = pd.to_datetime(trade_log['option_exit_time']) # Ensure it's datetime
+                            print(f"  LOG_CONCURRENCY: New trade initiated by signal at {nifty_signal_time}. Active until {current_active_trade_exit_time}. is_trade_active = True.")
+                    # else: trade_log was None (e.g. no valid entry price), so no trade became active.
+                    # self.is_trade_active state (and current_active_trade_exit_time) from a *previous* signal remains.
                 else:
                     print(f"  Could not fetch OHLCV data for option token {option_token}.")
+                
+                # REMOVED Problematic lines:
+                # print(f"  LOG_CONCURRENCY: Setting is_trade_active = False after processing NIFTY signal at {nifty_signal_time}")
+                # self.is_trade_active = False # This reset is now handled at the top of the loop based on time.
             else:
                 print(f"  No suitable option token found for NIFTY signal at {nifty_signal_time}.")
         
@@ -502,6 +534,7 @@ if __name__ == '__main__':
     sim_index_token = config.getint('SIMULATOR_SETTINGS', 'index_token')
     sim_initial_capital = config.getfloat('SIMULATOR_SETTINGS', 'initial_capital')
     # sim_option_data_buffer = config.getint('SIMULATOR_SETTINGS', 'option_data_fetch_buffer_minutes') # Used internally by run_simulation
+    sim_allow_concurrent_trades = config.getboolean('SIMULATOR_SETTINGS', 'concurrent_signal_trade', fallback=False)
 
     # --- 4. Extract Strategy-Specific Parameters ---
     strategy_class_name = config.get(SELECTED_STRATEGY_CONFIG_SECTION, 'strategy_class_name')
@@ -551,7 +584,8 @@ if __name__ == '__main__':
         option_type=sim_option_type,
         trade_interval=sim_trade_interval,
         trade_params=sim_trade_params,
-        initial_capital=sim_initial_capital
+        initial_capital=sim_initial_capital,
+        allow_concurrent_trades=sim_allow_concurrent_trades # Pass the new setting
     )
 
     # --- 8. Run Simulation and Process Results ---

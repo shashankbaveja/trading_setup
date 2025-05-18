@@ -20,14 +20,18 @@ from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 import matplotlib.pyplot as plt
 
-telegramToken = '8135376207:AAFoMWbyucyPPEzc7CYeAMTsNZfqHWYDMfw'
-telegramChatId = "-4653665640"
+telegramToken_global = '8135376207:AAFoMWbyucyPPEzc7CYeAMTsNZfqHWYDMfw' # Renamed to avoid conflict
+telegramChatId_global = "-4653665640"
 
 class system_initialization:
     def __init__(self):
         
         self.Kite = None
         self.con = None
+
+        # Telegram credentials for instance use
+        self.telegram_token = telegramToken_global
+        self.telegram_chat_id = telegramChatId_global
 
         config_file_path = "./security.txt"
         with open(config_file_path, 'r') as file:
@@ -85,9 +89,13 @@ class system_initialization:
         self.save_intruments_to_db(data = df)
 
         print('Ready to trade')
-        telegramMessage = 'Ready to trade'
-        telegramURL = 'https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}'.format(telegramToken,telegramChatId,telegramMessage)
-        response = requests.get(telegramURL)
+        # Send initial ready message using the new instance method if OrderPlacement has it,
+        # or keep it here if system_initialization itself should send it.
+        # For now, let's assume a specific ready message might be sent by LiveTrader itself.
+        # Original telegram message send:
+        # telegramMessage = 'Ready to trade'
+        # telegramURL = 'https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}'.format(self.telegram_token,self.telegram_chat_id,telegramMessage)
+        # response = requests.get(telegramURL)
         return self.kite
 
     def GetAccessToken(self):
@@ -194,6 +202,143 @@ class system_initialization:
             self.con.commit()
             # print("saved token to DB")
         self.con.close()
+
+class OrderPlacement(system_initialization):
+    def __init__(self):
+        super().__init__() # Initialize the base class to get self.kite, etc.
+        # Ensure the kite object is authenticated, init_trading might be called
+        # by the live trader script after instantiating OrderPlacement if needed
+        # or we ensure system_initialization's __init__ is enough.
+        # For now, assume self.kite is ready or will be made ready by calling init_trading()
+        # on an instance of this class.
+        print("OrderPlacement module initialized. Ensure init_trading() is called if access token needs refresh.")
+
+    def send_telegram_message(self, message: str):
+        """
+        Sends a message to the configured Telegram chat.
+        Args:
+            message (str): The message text to send.
+        """
+        if not self.telegram_token or not self.telegram_chat_id:
+            print("OrderPlacement: Telegram token or chat ID not configured. Cannot send message.")
+            return
+        
+        telegram_url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        params = {
+            'chat_id': self.telegram_chat_id,
+            'text': message,
+            'parse_mode': 'Markdown' # Optional: for formatting like *bold* or _italic_
+        }
+        try:
+            response = requests.get(telegram_url, params=params, timeout=10) # Added timeout
+            response.raise_for_status() # Raises an HTTPError for bad responses (4XX or 5XX)
+            print(f"OrderPlacement: Telegram message sent successfully: '{message[:50]}...'")
+        except requests.exceptions.RequestException as e:
+            print(f"OrderPlacement: Error sending Telegram message: {e}")
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred sending Telegram message: {e}")
+
+    def place_market_order_live(self, tradingsymbol: str, exchange: str, transaction_type: str, 
+                                quantity: int, product: str, tag: str = None):
+        """
+        Places a market order.
+        Args:
+            tradingsymbol (str): Trading symbol of the instrument.
+            exchange (str): Name of the exchange (e.g., self.kite.EXCHANGE_NFO, self.kite.EXCHANGE_NSE).
+            transaction_type (str): Transaction type (self.kite.TRANSACTION_TYPE_BUY or self.kite.TRANSACTION_TYPE_SELL).
+            quantity (int): Quantity to transact.
+            product (str): Product code (e.g., self.kite.PRODUCT_MIS, self.kite.PRODUCT_NRML).
+            tag (str, optional): An optional tag for the order.
+        Returns:
+            str: Order ID if successful, None otherwise.
+        """
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                product=product,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                tag=tag
+            )
+            print(f"OrderPlacement: Market order placed for {tradingsymbol}. Order ID: {order_id}")
+            return order_id
+        except KiteException as e:
+            print(f"OrderPlacement: Error placing market order for {tradingsymbol}: {e}")
+            # Consider specific error handling or re-raising
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred placing market order for {tradingsymbol}: {e}")
+        return None
+
+    def get_order_history_live(self, order_id: str):
+        """
+        Retrieves the history of an order.
+        Args:
+            order_id (str): The ID of the order.
+        Returns:
+            list: A list of order updates (dicts) if successful, None otherwise.
+        """
+        try:
+            history = self.kite.order_history(order_id=order_id)
+            # print(f"OrderPlacement: Fetched history for order ID {order_id}.")
+            return history
+        except KiteException as e:
+            print(f"OrderPlacement: Error fetching history for order ID {order_id}: {e}")
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred fetching history for order ID {order_id}: {e}")
+        return None
+
+    def get_all_orders_live(self):
+        """
+        Retrieves the list of all orders for the day.
+        Returns:
+            list: A list of order dicts if successful, None otherwise.
+        """
+        try:
+            orders = self.kite.orders()
+            # print(f"OrderPlacement: Fetched all orders. Count: {len(orders)}")
+            return orders
+        except KiteException as e:
+            print(f"OrderPlacement: Error fetching all orders: {e}")
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred fetching all orders: {e}")
+        return None
+
+    def get_positions_live(self):
+        """
+        Retrieves the current open positions.
+        Returns:
+            dict: A dictionary with 'net' and 'day' positions if successful, None otherwise.
+        """
+        try:
+            positions = self.kite.positions()
+            # print(f"OrderPlacement: Fetched positions.")
+            return positions
+        except KiteException as e:
+            print(f"OrderPlacement: Error fetching positions: {e}")
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred fetching positions: {e}")
+        return None
+
+    def get_trades_for_order_live(self, order_id: str):
+        """
+        Retrieves trades generated for a specific order.
+        Args:
+            order_id (str): The ID of the order.
+        Returns:
+            list: A list of trade dicts if successful, None otherwise.
+        """
+        try:
+            trades = self.kite.order_trades(order_id=order_id)
+            # print(f"OrderPlacement: Fetched trades for order ID {order_id}. Count: {len(trades)}")
+            return trades
+        except KiteException as e:
+            print(f"OrderPlacement: Error fetching trades for order ID {order_id}: {e}")
+        except Exception as e:
+            print(f"OrderPlacement: A general error occurred fetching trades for order ID {order_id}: {e}")
+        return None
 
 class kiteAPIs:
     def __init__(self):

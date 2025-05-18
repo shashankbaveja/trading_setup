@@ -51,33 +51,51 @@ This document tracks the implementation progress, technical details, and archite
 
 ## Recent Progress (as of last update)
 
-The primary focus has been on developing and refining the `TradingSimulator` and integrating it with a configuration-driven approach for strategies.
+Previously, the primary focus was on developing and refining the `TradingSimulator` and integrating it with a configuration-driven approach for strategies. The simulator was successfully run with the `DonchianBreakoutStrategy`.
 
-1.  **Configuration-Driven Simulator**:
-    *   `trading_simulator.py` has been significantly refactored to load all crucial parameters from `trading_config.ini`. This includes:
-        *   Global simulator settings (index token, initial capital).
-        *   Strategy selection (e.g., `STRATEGY_CONFIG_DonchianStandard`).
-        *   Strategy-specific indicator parameters (e.g., `length`, `exit_option` for Donchian).
-        *   Strategy-specific trading parameters (e.g., `option_type`, `trade_interval`, `trade_units`, `profit_target_pct`, `stop_loss_pct`, `max_holding_period_minutes`).
-    *   The `if __name__ == '__main__':` block in `trading_simulator.py` now dynamically instantiates the selected strategy and the simulator based on the configuration.
+**New Developments: Live Trading Module & Enhancements**
 
-2.  **Data Preparation Enhancements**:
-    *   The `DataPrep.fetch_and_prepare_data` method in `trading_strategies.py` was updated to always fetch 1-minute interval data from the database.
-    *   If a different `trade_interval` (e.g., '5minute') is specified in the strategy configuration, the 1-minute data is then resampled to the target interval using `DataPrep.convert_minute_data_interval`. This ensures consistency and allows strategies to operate on various timeframes using a unified base data source.
+A significant new phase involved the development of a live trading module (`live_trader.py`) and supporting enhancements to the existing codebase.
 
-3.  **Debugging and Refinements**:
-    *   **Configuration Parsing**: Fixed a `ValueError` caused by inline comments in `trading_config.ini` for integer parameters (e.g., `trade_units`). Comments were moved to separate lines.
-    *   **Attribute Errors**: Resolved an `AttributeError` in `trading_simulator.py` where `self.dp` was used instead of the correctly initialized `self.data_prep`.
-    *   **Option Data Fetching Logic**:
-        *   Corrected the logic for fetching option OHLCV data. The `option_data_end_date` in `TradingSimulator.run_simulation` is now correctly set to the overall simulation end date (`self.trade_end_date`) to ensure sufficient data is available for trades initiated near the end of a day or period.
-        *   Removed an outdated and unused method `_fetch_ohlcv_for_option_token` from `trading_simulator.py` to prevent confusion and ensure the new `DataPrep.fetch_and_prepare_data` is used consistently.
-    *   **Performance Metrics Formatting**: Fixed a `ValueError` in `TradingSimulator.calculate_performance_metrics` related to an invalid f-string format specifier for `profit_factor` when it was `np.inf`. The value is now pre-formatted into a string.
-    *   **SQLAlchemy Warnings**: Observed `UserWarning: pandas only supports SQLAlchemy connectable...` during database operations. While not critical errors, these suggest reviewing the database connection handling in `myKiteLib.py` and `trading_simulator.py` for optimal SQLAlchemy integration.
-    *   **MySQL Shutdown Errors**: Noticed `TypeError: 'NoneType' object cannot be interpreted as an integer` during MySQL socket shutdown at the end of the script execution. This seems to be an issue within the `mysql.connector` or `ssl` library when closing the connection.
+1.  **`myKiteLib.py` Enhancements for Live Operations**:
+    *   A new class `OrderPlacement` was introduced, inheriting from `system_initialization`.
+    *   This class encapsulates live trading actions:
+        *   `place_market_order_live()`: Places market orders.
+        *   `get_order_history_live()`, `get_all_orders_live()`, `get_positions_live()`, `get_trades_for_order_live()`: Wrappers for respective Kite API calls to fetch order and position details.
+    *   **Telegram Notifications**: 
+        *   The `system_initialization` class now stores Telegram bot token and chat ID as instance variables.
+        *   A `send_telegram_message(self, message: str)` method was added to `OrderPlacement` to send real-time updates.
 
-4.  **Successful Simulation Run**:
-    *   The `trading_simulator.py` script, configured for `STRATEGY_CONFIG_DonchianStandard`, completed a simulation run from May 1, 2025, to May 16, 2025.
-    *   Trades were generated, and performance metrics were calculated and saved to `cursor_logs/`.
+2.  **Live Trading Module (`live_trader.py`) Implementation**:
+    *   A new script `live_trader.py` containing the `LiveTrader` class was developed to automate live intraday option trading.
+    *   **Core Functionality**:
+        *   Operates in a polling loop during configurable market hours.
+        *   Performs a system health check before and during trading hours by verifying Kite API responsiveness.
+        *   Dynamically loads and applies a trading strategy (e.g., `DonchianBreakoutStrategy`) from `trading_strategies.py` based on `trading_config.ini`.
+        *   Fetches live 1-minute NIFTY 50 index data, calculates indicators, and generates BUY/SELL signals.
+        *   Selects the closest appropriate NIFTY option (CE, based on config) for the current month using a database query for instrument details (including `lot_size`).
+        *   **Trade Execution**: Places MARKET orders for option entry and exit.
+            *   **Entry Retry**: Implements a retry mechanism (default 2 retries) for entry order placement if initial attempts fail.
+        *   **Trade Management (Client-Side)**:
+            *   Monitors active trades by fetching the latest 1-minute candle of the traded option.
+            *   Checks for Stop-Loss (SL) and Target Price (TP) conditions based on the option's low/high prices against calculated SL/TP levels.
+            *   Monitors for strategy-generated EXIT signals on the NIFTY index.
+            *   Enforces a maximum trade holding period.
+        *   **Critical Error Handling**: 
+            *   If placing an *exit* order fails, the script logs a critical error, sends a Telegram alert, and terminates immediately (`sys.exit()`) to prevent unmanaged open positions.
+        *   **Logging**: Comprehensive logging to both console and a file (`live_trader.log`, overwritten on each run).
+        *   **Telegram Notifications**: Sends real-time alerts for:
+            *   NIFTY BUY/EXIT signals.
+            *   Entry order placement attempts (success/all retries failed).
+            *   Entry order confirmation.
+            *   Exit order placement.
+            *   Critical exit order failures.
+            *   Detailed trade closure summaries including PNL.
+    *   **Configuration Driven**: Highly configurable via `trading_config.ini`, including trading hours, polling intervals, active strategy, product type, and strategy parameters.
+    *   **Detailed Documentation**: For an in-depth understanding of the `LiveTrader` module, refer to [`docs/live_trader.md`](./live_trader.md).
+
+3.  **Concurrency Logic in `TradingSimulator` (Previous Update)**:
+    *   The `TradingSimulator` in `trading_simulator.py` was previously refactored to correctly handle non-concurrent trades by tracking the actual simulated exit time of an active trade when `allow_concurrent_trades` is `False`.
 
 ## Technical Details
 
@@ -148,9 +166,60 @@ The primary focus has been on developing and refining the `TradingSimulator` and
 
 ## Next Steps / Areas for Improvement
 
+*   **Live Trader Robustness**: Further testing and hardening of the `LiveTrader` module with real market data and conditions.
+    *   Consider more sophisticated error handling for non-critical API issues (e.g., temporary network glitches for non-order-placement calls).
+    *   Implement state persistence for `active_trade_details` in `LiveTrader` to allow recovery from script restarts.
 *   Investigate and resolve SQLAlchemy `UserWarning`s.
 *   Investigate and resolve MySQL connection shutdown `TypeError`s.
 *   Expand strategy library with more complex indicators and logic.
-*   Implement more sophisticated risk management and position sizing.
-*   Enhance reporting and visualization of simulation results.
-*   Consider parameter optimization techniques. 
+*   Implement more sophisticated risk management and position sizing (beyond fixed units/lots).
+*   Enhance reporting and visualization of simulation and live trading results.
+*   Consider parameter optimization techniques for strategies.
+
+## Live Trader Pre-Run Checklist
+
+Before running the `live_trader.py` script, ensure the following checks are performed:
+
+1.  **`trading_config.ini` Verification**:
+    *   **`[SIMULATOR_SETTINGS]` -> `index_token`**: Confirm it's set to the NIFTY 50 index token (e.g., 256265).
+    *   **`[LIVE_TRADER_SETTINGS]`**: 
+        *   `polling_interval_seconds`: Appropriate for your needs (e.g., 30-60).
+        *   `trading_start_time`, `trading_end_time`: Correct market hours (e.g., 09:20:00 - 15:00:00).
+        *   `health_check_start_time`, `health_check_end_time`: Correct pre-market check window (e.g., 09:15:00 - 09:20:00).
+        *   `active_strategy_config_section`: Points to the correct `[STRATEGY_CONFIG_*]` section you intend to use.
+        *   `product_type`: Set correctly (e.g., `MIS` for intraday).
+    *   **Strategy Configuration Section (e.g., `[STRATEGY_CONFIG_DonchianStandard]`)**: Referenced by `active_strategy_config_section`.
+        *   `strategy_class_name`: Correct strategy class (e.g., `DonchianBreakoutStrategy`).
+        *   Indicator parameters (e.g., `length`, `exit_option` for Donchian) are correctly set.
+        *   `option_type`: Typically `CE` for the current setup focusing on long calls.
+        *   `trade_units`: Number of lots for trading.
+        *   `profit_target_pct`, `stop_loss_pct`: Correct percentage values (e.g., 0.01 for 1%).
+
+2.  **`myKiteLib.py` & `security.txt`**: 
+    *   Ensure `security.txt` (or the path configured in `myKiteLib.py`) contains valid and up-to-date Kite API credentials (`api_key`, `api_secret`, `userID`, `pwd`, `totp_key`).
+    *   The `AccessToken` in `security.txt` should be recent, or confirm the auto-renewal logic within `system_initialization.init_trading()` is functioning reliably.
+    *   Telegram tokens (`telegramToken_global`, `telegramChatId_global` in `myKiteLib.py` or as configured) are correct for notifications.
+
+3.  **Database Connectivity**:
+    *   The MySQL server must be running and accessible.
+    *   Credentials in `security.txt` for database connection (`username`, `password`, `hostname`, `port`, `database_name`) must be correct.
+    *   The `instruments_zerodha` table should be populated and up-to-date for option contract lookups.
+
+4.  **Python Environment & Dependencies**:
+    *   The correct virtual environment (e.g., `/opt/anaconda3/envs/KiteConnect`) must be activated.
+    *   All required Python packages (`pandas`, `numpy`, `kiteconnect`, `ta`, `mysql-connector-python`, `SQLAlchemy`, `PyMySQL`, `selenium`, `pyotp`, `requests`) must be installed in the environment.
+
+5.  **System Time Synchronization**:
+    *   Ensure the machine running the script has its system time accurately synchronized with an NTP server to avoid issues with trading window checks and candle data alignment.
+
+6.  **Code Sanity Check (If any recent manual changes)**:
+    *   Briefly review `live_trader.py`, `myKiteLib.py`, and `trading_strategies.py` for any obvious errors if manual edits were made outside of automated generation.
+
+7.  **Monitoring Plan**:
+    *   Be prepared to closely monitor the `live_trader.log` file during the session.
+    *   Keep an eye on Telegram notifications for real-time updates.
+    *   Have the Kite trading platform (web or mobile) accessible for manual oversight or intervention if necessary.
+
+8.  **Capital and Risk**:
+    *   Ensure sufficient capital is available in the trading account.
+    *   Be aware of the risk settings (`trade_units`, `stop_loss_pct`) and trade with amounts you are comfortable with, especially during initial live runs. 

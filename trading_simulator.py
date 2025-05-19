@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 import os
 import calendar # Added for monthrange
 import configparser # Added for reading config file
@@ -32,8 +32,8 @@ class TradingSimulator:
     def __init__(self, 
                  index_token: int,          # Typically from [SIMULATOR_SETTINGS]
                  strategy_obj,             # Instantiated by main script based on strategy config
-                 trade_start_date: date, 
-                 trade_end_date: date,
+                 trade_start_date: datetime, # Changed to datetime
+                 trade_end_date: datetime,  # Changed to datetime
                  # Parameters below are typically from a specific [STRATEGY_CONFIG_...] section
                  option_type: str,          
                  trade_interval: str,       
@@ -184,19 +184,44 @@ class TradingSimulator:
                                          nifty_signals_for_trade_window: pd.Series | None = None # NEW: Nifty exit signals
                                          ) -> dict | None:
         if option_ohlcv_df.empty:
+            print(f"    TradeSim: Option OHLCV data is empty. Cannot simulate trade for Nifty signal at {nifty_signal_time}.")
             return None
 
-        entry_candle_row = option_ohlcv_df[option_ohlcv_df['date'] >= nifty_signal_time]
-        if entry_candle_row.empty:
-            print(f"    TradeSim: No option OHLCV data found at or after NIFTY signal time {nifty_signal_time} for option.")
-            return None
+        # --- Determine Entry Candle (t+1) ---
+        # option_ohlcv_df is assumed to be sorted by 'date'.
+        # Find the positional index of the option candle that aligns with or is the first one after nifty_signal_time.
+        # This is effectively the option's 't' candle relative to the Nifty signal.
         
-        entry_candle = entry_candle_row.iloc[0]
+        # Get all option candle datetime indices that are >= nifty_signal_time
+        potential_signal_aligned_option_candle_datetime_indices = option_ohlcv_df[option_ohlcv_df['date'] >= nifty_signal_time].index
+
+        if potential_signal_aligned_option_candle_datetime_indices.empty:
+            print(f"    TradeSim: No option OHLCV data found at or after NIFTY signal time {nifty_signal_time}. Cannot determine trade entry candle.")
+            return None
+
+        # The first such candle corresponds to Nifty's signal candle period 't'.
+        # Get its positional index in option_ohlcv_df:
+        try:
+            option_candle_t_datetime_idx = potential_signal_aligned_option_candle_datetime_indices[0]
+            option_candle_t_positional_idx = option_ohlcv_df.index.get_loc(option_candle_t_datetime_idx)
+        except IndexError:
+             print(f"    TradeSim: Error finding option candle 't' for Nifty signal at {nifty_signal_time}. This shouldn't happen if previous check passed.")
+             return None
+        
+        # The entry candle is the next one ('t+1')
+        entry_candle_positional_idx = option_candle_t_positional_idx + 1
+
+        if entry_candle_positional_idx >= len(option_ohlcv_df):
+            print(f"    TradeSim: NIFTY signal at {nifty_signal_time} (corresponds to option candle at {option_ohlcv_df.iloc[option_candle_t_positional_idx]['date']}). The next option candle ('t+1') is beyond available data.")
+            return None
+
+        entry_candle = option_ohlcv_df.iloc[entry_candle_positional_idx]
         option_entry_time = entry_candle['date']
         option_entry_price = entry_candle['open'] 
+        # --- End Determine Entry Candle ---
 
         if pd.isna(option_entry_price) or option_entry_price <= 0:
-             print(f"    TradeSim: Invalid entry price (NaN or zero) for option at {option_entry_time}. Skipping trade.")
+             print(f"    TradeSim: Invalid entry price (NaN or zero) for option at {option_entry_time} (t+1 candle). Skipping trade.")
              return None
 
         profit_target_price = option_entry_price * (1 + self.trade_params['profit_target_pct'])
@@ -206,24 +231,29 @@ class TradingSimulator:
         option_exit_time = None
         exit_reason = None
         
-        entry_candle_index_in_option_df = entry_candle.name 
+        max_holding_minutes = self.trade_params['max_holding_period_minutes'] # This is treated as number of candles by the loop
 
-        max_holding_minutes = self.trade_params['max_holding_period_minutes']
-
-        for i in range(max_holding_minutes):
-            current_option_candle_idx = entry_candle_index_in_option_df + i
+        # The loop iterates over candles *starting from the entry candle*
+        # Each 'i' here is an offset from the entry_candle_positional_idx
+        for i in range(max_holding_minutes): 
+            current_option_candle_positional_idx = entry_candle_positional_idx + i 
             
-            if current_option_candle_idx >= len(option_ohlcv_df):
-                exit_reason = "End of Option Data"
-                if i > 0: 
-                    option_exit_price = option_ohlcv_df.loc[entry_candle_index_in_option_df + i -1, 'close']
-                    option_exit_time = option_ohlcv_df.loc[entry_candle_index_in_option_df + i -1, 'date']
+            if current_option_candle_positional_idx >= len(option_ohlcv_df):
+                exit_reason = "End of Option Data during holding period"
+                if i > 0: # Make sure we held at least one candle past entry
+                    last_available_candle_positional_idx = current_option_candle_positional_idx - 1
+                    option_exit_price = option_ohlcv_df.iloc[last_available_candle_positional_idx]['close']
+                    option_exit_time = option_ohlcv_df.iloc[last_available_candle_positional_idx]['date']
+                # If i == 0 and this condition hits, it means entry_candle_positional_idx was the last candle.
+                # This should have been caught by the check: "if entry_candle_positional_idx >= len(option_ohlcv_df):" before the loop.
                 break
 
-            current_option_high = option_ohlcv_df.loc[current_option_candle_idx, 'high']
-            current_option_low = option_ohlcv_df.loc[current_option_candle_idx, 'low']
-            current_option_close = option_ohlcv_df.loc[current_option_candle_idx, 'close']
-            current_option_candle_time = option_ohlcv_df.loc[current_option_candle_idx, 'date']
+            # Access candle data using .iloc with the positional index
+            current_candle_data = option_ohlcv_df.iloc[current_option_candle_positional_idx]
+            current_option_high = current_candle_data['high']
+            current_option_low = current_candle_data['low']
+            current_option_close = current_candle_data['close']
+            current_option_candle_time = current_candle_data['date']
 
             # Priority 1: Check for NIFTY Strategy Exit Signal
             if nifty_signals_for_trade_window is not None:
@@ -241,6 +271,8 @@ class TradingSimulator:
             # Priority 2: Check for profit target
             if current_option_high >= profit_target_price:
                 option_exit_price = profit_target_price 
+                # For a more realistic fill, one might consider if the open of this candle already met the target,
+                # or if it gapped. Using profit_target_price assumes it traded at that level.
                 option_exit_time = current_option_candle_time
                 exit_reason = "Profit Target"
                 break
@@ -248,16 +280,20 @@ class TradingSimulator:
             # Priority 3: Check for stop loss
             if current_option_low <= stop_loss_price:
                 option_exit_price = stop_loss_price 
+                # Similar to profit target, assumes it traded at stop_loss_price.
                 option_exit_time = current_option_candle_time
                 exit_reason = "Stop Loss"
                 break
             
             # Priority 4: Check for Max Hold Time (if loop completes one before last iter)
-            if i == max_holding_minutes - 1: # This is the last candle to hold
-                option_exit_price = current_option_close 
+            # This check is for the current candle 'i'. If it's the last allowed candle to hold.
+            if i == max_holding_minutes - 1: 
+                option_exit_price = current_option_close # Exit at close of this last holding candle
                 option_exit_time = current_option_candle_time
                 exit_reason = "Max Hold Time"
-                break # Break here as it's the last iteration dedicated to this check
+                # No 'break' here is needed if it's the last iteration, loop will end.
+                # However, explicitly breaking is fine.
+                break 
         
         if option_exit_price is not None and option_entry_price > 0:
             pnl_per_unit = option_exit_price - option_entry_price # For Call option
@@ -571,9 +607,21 @@ if __name__ == '__main__':
     if active_strategy is None:
         raise SystemError("Failed to instantiate the active strategy. Check configuration.")
 
-    # --- 6. Define Simulation Period (can also come from config or cmd line) ---
-    sim_start_date = date(2025, 5, 1) 
-    sim_end_date = date(2025, 5, 16) 
+    # --- 6. Define Simulation Period from Config --- 
+    sim_start_date_str = config.get('SIMULATOR_SETTINGS', 'simulation_start_date', fallback=date.today().strftime('%Y-%m-%d'))
+    sim_end_date_str = config.get('SIMULATOR_SETTINGS', 'simulation_end_date', fallback=date.today().strftime('%Y-%m-%d'))
+
+    try:
+        start_date_only = datetime.strptime(sim_start_date_str, '%Y-%m-%d').date()
+        end_date_only = datetime.strptime(sim_end_date_str, '%Y-%m-%d').date()
+    except ValueError as e:
+        print(f"Error parsing simulation dates from config: {e}. Ensure format is YYYY-MM-DD.")
+        print(f"Using current date ({date.today().strftime('%Y-%m-%d')}) as fallback.")
+        start_date_only = date.today()
+        end_date_only = date.today()
+
+    sim_start_date = datetime.combine(start_date_only, time(0, 0, 0))
+    sim_end_date = datetime.combine(end_date_only, time(23, 59, 59))
     
     # --- 7. Instantiate TradingSimulator ---
     simulator = TradingSimulator(

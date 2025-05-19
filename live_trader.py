@@ -25,7 +25,6 @@ class LiveTrader:
         if not os.path.exists(self.config_file_path):
             raise FileNotFoundError(f"Configuration file not found: {self.config_file_path}")
         self.config.read(self.config_file_path)
-
         self._setup_logging()
         self.logger.info("--- LiveTrader Initializing ---")
 
@@ -188,14 +187,52 @@ class LiveTrader:
                 if not self.trading_session_enabled: # Check if _manage_trading_session_state decided to end session
                     break
 
-                # Core logic will go here in the next steps:
                 # 1. Fetch NIFTY data
-                # 2. Calculate stats & Generate signals
-                # 3. If trade active: monitor
-                # 4. If no trade active & BUY signal & trade_execution_allowed: initiate
-                self.logger.info(f"Looping... Trade Execution Allowed: {self.trade_execution_allowed}, Trade Active: {self.is_trade_active}")
+                today_str = date.today().strftime('%Y-%m-%d')
+                nifty_data = self.order_manager.kite.historical_data(
+                    instrument_token=self.nifty_index_token,
+                    from_date=today_str,
+                    to_date=today_str,
+                    interval='minute'
+                )
+                
+                if nifty_data:
+                    df = pd.DataFrame(nifty_data)
+                    # Debug log to check data structure
+                    self.logger.info(f"Raw data columns: {df.columns.tolist()}")
+                    self.logger.info(f"First row date type: {type(df['date'].iloc[0]) if 'date' in df.columns else 'No date column'}")
+                    
+                    # Convert date column to datetime if it exists
+                    if 'date' in df.columns:
+                        df['date'] = pd.to_datetime(df['date'])
+                        self.logger.info(f"After conversion - First row date type: {type(df['date'].iloc[0])}")
+                    
+                    # 2. Calculate stats & Generate signals
+                    df_with_stats = self.data_prep.calculate_statistics(df.copy(), donchian_length=self.strategy_obj.length)
+                    if not df_with_stats.empty:
+                        latest_row = df_with_stats.iloc[-1]
+                        self.logger.info(f"Latest row date type: {type(latest_row['date']) if 'date' in latest_row else 'No date in latest row'}")
+                        
+                        prev_row = df_with_stats.iloc[-2] if len(df_with_stats) > 1 else None
+                        prev_close = prev_row['close'] if prev_row is not None else None
+                        prev_close_str = f"{prev_close:.2f}" if prev_close is not None else "N/A"
+                        self.logger.info(f"NIFTY Stats - Close: {latest_row['close']:.2f}, Previous Donchian Upper: {latest_row['don_upper_prev']:.2f}, Previous Close: {prev_close_str}")
+                        
+                        # Generate signals
+                        df_with_signals = self.strategy_obj.generate_signals(df_with_stats.copy())
+                        latest_signal = df_with_signals.iloc[-1]['signal']
+                        
+                        # 3. If trade active: monitor
+                        if self.is_trade_active:
+                            self._monitor_active_trade(latest_signal, latest_row)
+                        # 4. If no trade active & BUY signal & trade_execution_allowed: initiate
+                        elif latest_signal == 1 and self.trade_execution_allowed:
+                            # Use the timestamp from the data
+                            signal_time = latest_row['date'] if 'date' in latest_row else datetime.now()
+                            self.logger.info(f"Signal time type before trade initiation: {type(signal_time)}")
+                            self._initiate_new_trade(signal_time, latest_row['close'])
 
-                # Placeholder for now, will be replaced with actual logic
+                self.logger.info(f"Looping... Trade Execution Allowed: {self.trade_execution_allowed}, Trade Active: {self.is_trade_active}")
                 time.sleep(self.polling_interval_seconds) 
 
             except KeyboardInterrupt:
@@ -203,20 +240,118 @@ class LiveTrader:
                 self.trading_session_enabled = False
             except Exception as e:
                 self.logger.error(f"An unexpected error occurred in the main trading loop: {e}", exc_info=True)
-                # Depending on the error, we might want to pause or stop
-                self.trading_session_enabled = False # Safely stop on unhandled errors
-                # Consider adding a short delay before exiting loop to allow logs to flush
+                self.trading_session_enabled = False
                 time.sleep(5) 
 
         self.logger.info("--- Live Trading Session Ended ---")
 
     def _find_live_option_token(self, nifty_price_at_signal, nifty_signal_time):
-        # This method needs to be implemented to find a suitable live option token
-        # It should return a tuple (tradingsymbol, token, lot_size) or None if no suitable option is found
-        # This is a placeholder and should be replaced with the actual implementation
-        return None
+        """Find a suitable option token based on current NIFTY price and expiry using SQL queries.
+        
+        Args:
+            nifty_price_at_signal: Current NIFTY price when signal was generated
+            nifty_signal_time: Time when the signal was generated
+            
+        Returns:
+            tuple: (tradingsymbol, token, lot_size) or None if no suitable option found
+        """
+        try:
+            # Debug log for input parameters
+            self.logger.info(f"Finding option token - Signal time type: {type(nifty_signal_time)}, Value: {nifty_signal_time}")
+            
+            # Get database connection from kiteAPIs
+            conn = self.order_manager.k_apis.startKiteSession.con
+            if not conn or not conn.is_connected():
+                self.logger.error("Database connection not available")
+                return None
+
+            # Ensure nifty_signal_time is a datetime object
+            if not isinstance(nifty_signal_time, datetime):
+                self.logger.error(f"Invalid signal time type: {type(nifty_signal_time)}. Expected datetime.")
+                return None
+
+            # Build query based on option type
+            if self.option_type == 'CE':
+                query = """
+                WITH last_expiry_month AS (
+                    SELECT MAX(expiry) AS last_expiry_month
+                    FROM kiteConnect.instruments_zerodha
+                    WHERE name = 'NIFTY'
+                      AND instrument_type = 'CE'
+                      AND EXTRACT(MONTH FROM expiry) = EXTRACT(MONTH FROM %(signal_date)s)
+                      AND EXTRACT(YEAR FROM expiry) = EXTRACT(YEAR FROM %(signal_date)s)
+                ),
+                filtered_options AS (
+                    SELECT a.instrument_token, a.tradingsymbol, a.lot_size, a.strike,
+                           ROW_NUMBER() OVER (ORDER BY a.strike ASC) AS rnum
+                    FROM kiteConnect.instruments_zerodha a
+                    INNER JOIN last_expiry_month b ON a.expiry = b.last_expiry_month
+                    WHERE a.name = 'NIFTY'
+                      AND a.instrument_type = 'CE'
+                      AND a.strike >= %(strike_price)s
+                )
+                SELECT instrument_token, tradingsymbol, lot_size, strike
+                FROM filtered_options 
+                WHERE rnum = 1;
+                """
+            else:  # PE
+                query = """
+                WITH last_expiry_month AS (
+                    SELECT MAX(expiry) AS last_expiry_month
+                    FROM kiteConnect.instruments_zerodha
+                    WHERE name = 'NIFTY'
+                      AND instrument_type = 'PE'
+                      AND EXTRACT(MONTH FROM expiry) = EXTRACT(MONTH FROM %(signal_date)s)
+                      AND EXTRACT(YEAR FROM expiry) = EXTRACT(YEAR FROM %(signal_date)s)
+                ),
+                filtered_options AS (
+                    SELECT a.instrument_token, a.tradingsymbol, a.lot_size, a.strike,
+                           ROW_NUMBER() OVER (ORDER BY a.strike DESC) AS rnum
+                    FROM kiteConnect.instruments_zerodha a
+                    INNER JOIN last_expiry_month b ON a.expiry = b.last_expiry_month
+                    WHERE a.name = 'NIFTY'
+                      AND a.instrument_type = 'PE'
+                      AND a.strike <= %(strike_price)s
+                )
+                SELECT instrument_token, tradingsymbol, lot_size, strike
+                FROM filtered_options 
+                WHERE rnum = 1;
+                """
+
+            params = {
+                'signal_date': nifty_signal_time.date(),
+                'strike_price': float(nifty_price_at_signal)
+            }
+            
+            self.logger.info(f"SQL params - signal_date: {params['signal_date']}, strike_price: {params['strike_price']}")
+
+            option_df = pd.read_sql_query(query, conn, params=params)
+            
+            if option_df.empty:
+                self.logger.error(f"No {self.option_type} option found for NIFTY at {nifty_price_at_signal:.2f}, time {nifty_signal_time}")
+                return None
+
+            # Extract option details
+            option_token = int(option_df['instrument_token'].iloc[0])
+            option_symbol = option_df['tradingsymbol'].iloc[0]
+            option_lot_size = int(option_df['lot_size'].iloc[0])
+            strike_price = float(option_df['strike'].iloc[0])
+
+            self.logger.info(f"Selected {self.option_type} option: {option_symbol} (Strike: {strike_price}, "
+                           f"Lot Size: {option_lot_size})")
+            
+            return (option_symbol, option_token, option_lot_size)
+            
+        except Exception as e:
+            self.logger.error(f"Error finding suitable option: {e}", exc_info=True)
+            return None
 
     def _initiate_new_trade(self, nifty_signal_time: datetime, nifty_price_at_signal: float):
+        # Safety check for datetime
+        if not isinstance(nifty_signal_time, datetime):
+            self.logger.error(f"Invalid signal time type in _initiate_new_trade: {type(nifty_signal_time)}. Expected datetime.")
+            return
+            
         self.logger.info(f"Attempting to initiate new {self.option_type} trade based on NIFTY signal at {nifty_signal_time}, Price: {nifty_price_at_signal:.2f}")
         
         option_selection = self._find_live_option_token(nifty_price_at_signal, nifty_signal_time)
@@ -246,7 +381,7 @@ class LiveTrader:
                 self.logger.info(f"Entry order attempt {attempt + 1} successful. Order ID: {entry_order_id}")
                 # Send Telegram message for successful order placement
                 telegram_msg = (f"LiveTrader: ENTRY Order PLACED for {self.trade_quantity_actual} units of {option_symbol} ({self.option_type}).\n"
-                                f"NIFTY Signal @ {nifty_signal_time.strftime('%H:%M:%S')} (Price: {nifty_price_at_signal:.2f}).\n"
+                                f"NIFTY Signal @ {nifty_signal_time.strftime('%H:%M:%S') if isinstance(nifty_signal_time, datetime) else nifty_signal_time} (Price: {nifty_price_at_signal:.2f}).\n"
                                 f"Order ID: {entry_order_id}")
                 self.order_manager.send_telegram_message(telegram_msg)
                 break # Exit loop on success
@@ -261,7 +396,7 @@ class LiveTrader:
                     entry_order_id = None # Explicitly set to None
                     # Send Telegram message for entry order failure after all retries
                     telegram_msg = (f"LiveTrader: ALL FAILED Entry Order Attempts for {self.trade_quantity_actual} units of {option_symbol} ({self.option_type}).\n"
-                                    f"NIFTY Signal @ {nifty_signal_time.strftime('%H:%M:%S')} (Price: {nifty_price_at_signal:.2f}). No trade initiated.")
+                                    f"NIFTY Signal @ {nifty_signal_time.strftime('%H:%M:%S') if isinstance(nifty_signal_time, datetime) else nifty_signal_time} (Price: {nifty_price_at_signal:.2f}). No trade initiated.")
                     self.order_manager.send_telegram_message(telegram_msg)
                     break # Exit loop after all retries failed
 
@@ -273,38 +408,12 @@ class LiveTrader:
                 'option_lot_size': self.option_lot_size,
                 'quantity_actual': self.trade_quantity_actual,
                 'kite_entry_order_id': entry_order_id,
-                'status': 'PENDING_ENTRY_CONFIRMATION'
+                'status': 'PENDING_ENTRY_CONFIRMATION',
+                'nifty_signal_time': nifty_signal_time,
+                'nifty_price_at_signal': nifty_price_at_signal,
+                'max_hold_exit_time': datetime.now() + timedelta(minutes=self.max_holding_period_minutes)
             }
             self.logger.info(f"New {self.option_type} trade initiated. Trade details: {self.active_trade_details}")
-
-            if exit_trigger_reason:
-                self.logger.info(f"{exit_trigger_reason} condition met for option {self.active_trade_details['option_symbol']}. Attempting to exit.")
-                product_type = self.config.get('LIVE_TRADER_SETTINGS', 'product_type', fallback=self.order_manager.kite.PRODUCT_MIS)
-                exit_order_id = self.order_manager.place_market_order_live(
-                    tradingsymbol=self.active_trade_details['option_symbol'],
-                    exchange=self.order_manager.kite.EXCHANGE_NFO,
-                    transaction_type=self.order_manager.kite.TRANSACTION_TYPE_SELL,
-                    quantity=self.active_trade_details['quantity_actual'],
-                    product=product_type
-                )
-                if exit_order_id:
-                    self.active_trade_details['kite_exit_order_id'] = exit_order_id
-                    self.active_trade_details['status'] = 'PENDING_EXIT_CONFIRMATION'
-                    self.active_trade_details['exit_trigger_reason'] = exit_trigger_reason
-                    self.active_trade_details['exit_price_for_trigger'] = exit_price_for_trigger 
-                    self.logger.info(f"Exit order placed for {self.active_trade_details['option_symbol']}. Order ID: {exit_order_id}. Reason: {exit_trigger_reason}. Status: PENDING_EXIT_CONFIRMATION")
-                    # Send Telegram message for successful exit order placement
-                    telegram_msg = (f"LiveTrader: EXIT Order PLACED for {self.active_trade_details['option_symbol']}.\n"
-                                    f"Reason: {exit_trigger_reason}. Order ID: {exit_order_id}.")
-                    self.order_manager.send_telegram_message(telegram_msg)
-                else:
-                    self.logger.critical(f"CRITICAL: Failed to place EXIT order for {self.active_trade_details.get('option_symbol', 'UNKNOWN_SYMBOL')}! Position may be live. Terminating script.")
-                    # Also send a telegram message if possible before exiting (though script might terminate too fast)
-                    telegram_msg = (f"LiveTrader CRITICAL: FAILED to place EXIT order for {self.active_trade_details.get('option_symbol', 'UNKNOWN_SYMBOL')}! Position may be live.")
-                    self.order_manager.send_telegram_message(telegram_msg)
-                    sys.exit(f"CRITICAL_EXIT: EXIT_ORDER_PLACEMENT_FAILED for {self.active_trade_details.get('option_symbol', 'UNKNOWN_SYMBOL')}")
-            else:
-                self.logger.debug(f"No exit condition met for active trade {self.active_trade_details['option_symbol']}. Holding.")
 
     def _monitor_active_trade(self, latest_nifty_signal: int, latest_nifty_ohlc: pd.Series):
         if not self.active_trade_details or not self.is_trade_active:
@@ -472,7 +581,7 @@ class LiveTrader:
             pnl_per_unit = exit_price - self.active_trade_details['entry_price_actual']
             total_pnl = pnl_per_unit * self.active_trade_details['quantity_actual']
             pnl_summary = f"PNL/Unit: {pnl_per_unit:.2f}, Total PNL: {total_pnl:.2f}"
-            trade_summary += f"\n{pnl_summary}"
+            trade_summary = f"{trade_summary}\n{pnl_summary}"
             self.logger.info(pnl_summary)
         else:
             trade_summary += "\nPNL not calculated (missing entry/exit price)."

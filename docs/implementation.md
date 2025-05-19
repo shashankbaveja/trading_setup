@@ -222,4 +222,68 @@ Before running the `live_trader.py` script, ensure the following checks are perf
 
 8.  **Capital and Risk**:
     *   Ensure sufficient capital is available in the trading account.
-    *   Be aware of the risk settings (`trade_units`, `stop_loss_pct`) and trade with amounts you are comfortable with, especially during initial live runs. 
+    *   Be aware of the risk settings (`trade_units`, `stop_loss_pct`) and trade with amounts you are comfortable with, especially during initial live runs.
+
+## New Strategy Development: Fibonacci Retracement Trend Continuation
+
+**Objective**: Identify pullbacks to Fibonacci levels within an established trend on the NIFTY50 index (identified by Higher Highs and Higher Lows) and enter call option positions anticipating a resumption of the trend. This strategy focuses on short-term (5-10 minute) reversals/continuations.
+
+**Core Logic**:
+
+1.  **Swing Point Identification (Zig Zag Pattern)**:
+    *   Develop a robust algorithm to identify significant swing highs and swing lows in the NIFTY50 index price action (e.g., on 1-minute or 5-minute data).
+    *   Parameters for swing detection (e.g., number of bars, percentage/point deviation) will be configurable to capture swings that define a 10-minute to 60-minute zig-zag pattern.
+
+2.  **Trend Identification (Market Structure)**:
+    *   **Uptrend**: Confirmed by a sequence of Higher Highs (HH) and Higher Lows (HL) formed by the identified swing points.
+    *   **Downtrend Reversal for Calls**:
+        *   Identify an established downtrend (Lower Highs - LH, Lower Lows - LL).
+        *   Look for a break in this pattern: a Low (LL), followed by a Higher Low (HL), and then a Higher High (HH). This signals a potential shift to an uptrend.
+
+3.  **Fibonacci Retracement Application**:
+    *   **In an Uptrend**: Once a new HH is formed after an HL, draw Fibonacci retracement levels from the most recent confirmed HL to the most recent confirmed HH.
+    *   **Post Downtrend Reversal**: After the LL -> HL -> HH sequence confirms a potential new uptrend, draw Fibonacci from this new HL to the new HH.
+
+4.  **Entry Signal (Buying Call Options)**:
+    *   **Condition 1 (Trend)**: NIFTY50 index is in a confirmed uptrend (HH/HL structure) or has just signaled a downtrend reversal (LL->HL->HH).
+    *   **Condition 2 (Pullback)**: Price retraces from the recent swing high (HH) and approaches a key Fibonacci support level (e.g., 38.2%, 50.0%, 61.8%).
+    *   **Condition 3 (Confirmation)**: Bullish confirmation at the Fibonacci level (e.g., bullish candlestick pattern, RSI divergence/move from oversold, volume surge).
+    *   **Action**: Buy a NIFTY50 Call option.
+
+5.  **Option Selection**:
+    *   **Strike Price**: At-the-money (ATM) or slightly out-of-the-money (OTM) call options.
+    *   **Expiry**: Weekly expiry, with sufficient time to avoid rapid decay (e.g., 2-3 days minimum, unless scalping).
+
+6.  **Stop Loss**:
+    *   **Index-Based**: Below the Fibonacci level that provided support, or below the low of the confirmation candle/recent swing low.
+    *   **Option-Based**: Percentage of option premium or derived from index stop-loss.
+
+7.  **Target Price**:
+    *   Previous swing high.
+    *   Fibonacci extension levels (if previous swing high is broken).
+    *   Fixed Risk-Reward ratio.
+
+**Implementation Phases for Fibonacci Strategy**:
+
+*   **Phase F1: Core Price Action Analysis Module Enhancement**
+    *   Task F1.1: Design and implement the configurable Swing Point Detection algorithm. This is critical for identifying HH/HL/LH/LL.
+    *   Task F1.2: Ensure Fibonacci calculation is robust and can be applied to dynamic swing points.
+    *   Task F1.3: Integrate optional confirmation indicators (e.g., RSI).
+
+*   **Phase F2: Trend & Pattern Identification Logic**
+    *   Task F2.1: Implement logic to identify uptrends (HH/HL sequences) and downtrends (LH/LL sequences) based on swing points.
+    *   Task F2.2: Implement logic to detect the specific "downtrend reversal" pattern (LL -> HL -> HH).
+
+*   **Phase F3: Signal Generation & Trade Logic**
+    *   Task F3.1: Develop the signal generation logic combining trend, Fibonacci levels, and confirmation.
+    *   Task F3.2: Define option selection rules within the strategy.
+    *   Task F3.3: Define SL/TP logic based on swing structure and Fibonacci levels.
+
+*   **Phase F4: Backtesting & Refinement**
+    *   Task F4.1: Adapt/use the existing backtesting environment for this new strategy.
+    *   Task F4.2: Thoroughly backtest and analyze performance.
+    *   Task F4.3: Iteratively refine swing detection parameters, Fibonacci levels, and confirmation rules.
+
+*   **Phase F5: Documentation**
+    *   Task F5.1: Create `docs/strategy_documentation/fibonacci_swing_trend.md` for in-depth details.
+    *   Task F5.2: Keep this section of `implementation.md` updated with progress. 

@@ -332,7 +332,7 @@ class DonchianBreakoutStrategy(BaseStrategy):
         # 'signal' would be -1 as it's the last assignment. This might be okay if exit has priority.
 
         # Fill NaN signals with 0 (HOLD) - especially for the initial period where indicators are not yet calculated
-        df['signal'].fillna(0, inplace=True)
+        df['signal'] = df['signal'].fillna(0)
         df['signal'] = df['signal'].astype(int)
 
         print(f"{self.strategy_name}: Signals generated.DataFrame shape: {df.shape}")

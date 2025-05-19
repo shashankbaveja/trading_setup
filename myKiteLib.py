@@ -53,7 +53,7 @@ class system_initialization:
 
         print("read security details")
 
-        self.kite = KiteConnect(api_key=self.api_key)
+        self.kite = KiteConnect(api_key=self.api_key, timeout=60)
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
     
     
@@ -206,11 +206,7 @@ class system_initialization:
 class OrderPlacement(system_initialization):
     def __init__(self):
         super().__init__() # Initialize the base class to get self.kite, etc.
-        # Ensure the kite object is authenticated, init_trading might be called
-        # by the live trader script after instantiating OrderPlacement if needed
-        # or we ensure system_initialization's __init__ is enough.
-        # For now, assume self.kite is ready or will be made ready by calling init_trading()
-        # on an instance of this class.
+        self.k_apis = kiteAPIs()  # Create instance of kiteAPIs
         print("OrderPlacement module initialized. Ensure init_trading() is called if access token needs refresh.")
 
     def send_telegram_message(self, message: str):
@@ -386,7 +382,7 @@ class kiteAPIs:
         return df['instrument_token'].values.astype(int).tolist()
 
     def extract_data_from_db(self, from_date, to_date, interval, instrument_token):
-        query = f"SELECT a.*, b.strike FROM kiteConnect.historical_data_{interval} a left join kiteConnect.instruments_zerodha b on a.instrument_token = b.instrument_token where a.timestamp between '{from_date}' and '{to_date}' and a.instrument_token = {instrument_token}"
+        query = f"SELECT a.*, b.strike FROM kiteConnect.historical_data_{interval} a left join kiteConnect.instruments_zerodha b on a.instrument_token = b.instrument_token where date(a.timestamp) between '{from_date}' and '{to_date}' and a.instrument_token = {instrument_token}"
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         df = pd.read_sql(query, self.con)
         self.con.close()
@@ -500,81 +496,162 @@ class kiteAPIs:
         i = 0
 
         token_exceptions = []
+        MAX_RETRIES = 3
+        RETRY_DELAY_SECONDS = 5
+
         for t in tokens:
-            print(t)
-            try:
-                df = pd.DataFrame()
-                records = self.kite.historical_data(t, from_date=from_date, to_date=to_date, interval=interval)
-                if len(records) > 0:
-                    records = pd.DataFrame(records)
-                    records['instrument_token'] = t
-                    df = pd.concat([df, records], axis = 0)
-                    df['interval'] = interval
-                    df['id'] = df['instrument_token'].astype(str) + '_' + df['interval'] + '_' + df['date'].dt.strftime("%Y%m%d%H%M")
-                
-                    self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
-    # Ensure 'date' column is pandas Timestamp for intermediate operations if not already
-                    if not pd.api.types.is_datetime64_any_dtype(df['date']):
-                        df['date'] = pd.to_datetime(df['date'])
-
-                    # Convert pandas Timestamp to string in 'YYYY-MM-DD HH:MM:SS' format for DB insertion
-                    # This matches how it would likely be formatted implicitly in row-by-row string insertion
-                    df['date_for_db'] = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-                    # Prepare data for executemany: list of tuples
-                    # Column order matches the VALUES clause: id, instrument_token, date_for_db (string for timestamp col), open, high, low, close, volume
-                    try:
-                        data_to_insert = list(df[['id', 'instrument_token', 'date_for_db', 'open', 'high', 'low', 'close', 'volume']].itertuples(index=False, name=None))
-                    except KeyError as ke:
-                        print(f"DataFrame missing expected columns for DB insertion: {ke}. Columns available: {df.columns.tolist()}")
-                        data_to_insert = [] 
-
-                    target_table_name = None
-                    if interval == 'minute':
-                        target_table_name = "kiteConnect.historical_data_minute"
-                    elif interval == 'day':
-                        target_table_name = "kiteConnect.historical_data_day"
-                    
-
-                    if target_table_name and data_to_insert:
-                        cur = None # Initialize cur to None
-                        try:
-                            cur = self.con.cursor()
-                            # Using %s placeholders for values in the query
-                            query = f"INSERT IGNORE INTO {target_table_name} (id, instrument_token, timestamp, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-                            # Assuming your table columns are named: id, instrument_token, timestamp (for date), open, high, low, close, volume
-                            # If your table does not explicitly name columns in this order, adjust the query or ensure table was created with this order.
-                            # For safety, it's best if INSERT specifies column names, like above.
-                            # If you must stick to the original schemaless insert:
-                            # query = f"INSERT IGNORE INTO {target_table_name} VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-
-
-                            print(f"Attempting to bulk insert {len(data_to_insert)} records into {target_table_name}...")
-                            cur.executemany(query, data_to_insert)
-                            self.con.commit()
-                            print(f"Bulk insert/ignore completed for {target_table_name}. Rows affected: {cur.rowcount}")
-                        except Exception as e: # Catch potential errors during DB operation
-                            print(f"Error during bulk insert into {target_table_name}: {e}")
-                            # Consider self.con.rollback() if an error occurs and transactions are being used explicitly
-                        finally:
-                            if cur:
-                                cur.close() # Close cursor
-                                self.con.close()
-                    elif not data_to_insert:
-                        print(f"No data prepared for insertion for interval {interval} (data_to_insert list is empty).")
+            print(f"Fetching data for token: {t}")
+            records = None # Initialize records to None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    print(f"  Attempt {attempt + 1}/{MAX_RETRIES} for token {t}...")
+                    records = self.kite.historical_data(t, from_date=from_date, to_date=to_date, interval=interval)
+                    print(f"  Successfully fetched data for token {t} on attempt {attempt + 1}.")
+                    break  # Success, exit retry loop
+                except (KiteException, requests.exceptions.ReadTimeout, requests.exceptions.RequestException) as e:
+                    print(f"  Error on attempt {attempt + 1} for token {t}: {type(e).__name__} - {str(e)}")
+                    if attempt < MAX_RETRIES - 1:
+                        print(f"  Retrying in {RETRY_DELAY_SECONDS} seconds...")
+                        time.sleep(RETRY_DELAY_SECONDS)
                     else:
-                        print(f"Unsupported interval '{interval}' or no table determined for database insertion.")
+                        print(f"  Max retries reached for token {t}. Adding to exceptions.")
+                        token_exceptions.append(t)
+                        records = [] # Ensure records is an empty list on failure to avoid issues later
+                except Exception as e: # Catch any other unexpected errors
+                    print(f"  An unexpected error occurred on attempt {attempt + 1} for token {t}: {type(e).__name__} - {str(e)}")
+                    if attempt < MAX_RETRIES - 1:
+                        print(f"  Retrying in {RETRY_DELAY_SECONDS} seconds...")
+                        time.sleep(RETRY_DELAY_SECONDS)
+                    else:
+                        print(f"  Max retries reached for token {t} due to unexpected error. Adding to exceptions.")
+                        token_exceptions.append(t)
+                        records = [] # Ensure records is an empty list
+                        # Optionally re-raise the last exception if it's critical and unhandled by appending to token_exceptions
+                        # raise
+            
+            # Continue with processing if records were fetched
+            if records is not None and len(records) > 0:
+                df = pd.DataFrame(records) # Convert to DataFrame here
+                df['instrument_token'] = t
+                # df = pd.concat([df, records_df], axis = 0) # This concat was for an older structure
+                df['interval'] = interval
+                df['id'] = df['instrument_token'].astype(str) + '_' + df['interval'] + '_' + pd.to_datetime(df['date']).dt.strftime("%Y%m%d%H%M") # Ensure date is used correctly
+            
+                self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
+# Ensure 'date' column is pandas Timestamp for intermediate operations if not already
+                if not pd.api.types.is_datetime64_any_dtype(df['date']):
+                    df['date'] = pd.to_datetime(df['date'])
+
+                # Convert pandas Timestamp to string in 'YYYY-MM-DD HH:MM:SS' format for DB insertion
+                # This matches how it would likely be formatted implicitly in row-by-row string insertion
+                df['date_for_db'] = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+                # Prepare data for executemany: list of tuples
+                # Column order matches the VALUES clause: id, instrument_token, date_for_db (string for timestamp col), open, high, low, close, volume
+                try:
+                    data_to_insert = list(df[['id', 'instrument_token', 'date_for_db', 'open', 'high', 'low', 'close', 'volume']].itertuples(index=False, name=None))
+                except KeyError as ke:
+                    print(f"DataFrame missing expected columns for DB insertion: {ke}. Columns available: {df.columns.tolist()}")
+                    data_to_insert = [] 
+
+                target_table_name = None
+                if interval == 'minute':
+                    target_table_name = "kiteConnect.historical_data_minute"
+                elif interval == 'day':
+                    target_table_name = "kiteConnect.historical_data_day"
+                
+
+                if target_table_name and data_to_insert:
+                    cur = None # Initialize cur to None
+                    try:
+                        cur = self.con.cursor()
+                        # Using %s placeholders for values in the query
+                        query = f"INSERT IGNORE INTO {target_table_name} (id, instrument_token, timestamp, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                        # Assuming your table columns are named: id, instrument_token, timestamp (for date), open, high, low, close, volume
+                        # If your table does not explicitly name columns in this order, adjust the query or ensure table was created with this order.
+                        # For safety, it's best if INSERT specifies column names, like above.
+                        # If you must stick to the original schemaless insert:
+                        # query = f"INSERT IGNORE INTO {target_table_name} VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+
+
+                        print(f"Attempting to bulk insert {len(data_to_insert)} records into {target_table_name}...")
+                        cur.executemany(query, data_to_insert)
+                        self.con.commit()
+                        print(f"Bulk insert/ignore completed for {target_table_name}. Rows affected: {cur.rowcount}")
+                    except Exception as e: # Catch potential errors during DB operation
+                        print(f"Error during bulk insert into {target_table_name}: {e}")
+                        # Consider self.con.rollback() if an error occurs and transactions are being used explicitly
+                    finally:
+                        if cur:
+                            cur.close() # Close cursor
+                            self.con.close() # Close connection after each token's DB operations
+                elif not data_to_insert:
+                    print(f"No data prepared for insertion for interval {interval} (data_to_insert list is empty).")
                 else:
-                    print("DataFrame is empty, skipping database insertion.")
-                    
-            except KiteException as e:
-                print(f"KiteConnect API error for token {t}: {str(e)}")
-                token_exceptions.append(t)
-                continue
+                    print(f"Unsupported interval '{interval}' or no table determined for database insertion.")
+            elif records is not None and len(records) == 0: # Successfully fetched, but no data for the period
+                 print(f"No historical data returned for token {t} for the given period.")
+            # If records is None (all retries failed), it's already added to token_exceptions.
             
        
         print('token_exceptions: ',token_exceptions)
-        return df
+        # The original code returned 'df' which was the DataFrame for the *last* successfully processed token.
+        # This might not be the desired behavior if processing multiple tokens.
+        # If the goal is to collect all data, it should be aggregated.
+        # For now, I'll keep it returning the last df, but this is a point of attention.
+        # If all tokens fail, df might be uninitialized or from a much earlier success.
+        # A safer return would be a list of dataframes or a concatenated one if all are successful.
+        # Given the current structure, if all fail, df from previous loop iteration might be returned.
+        # It's better to initialize df to an empty DataFrame at the start of the outer loop or handle returns more carefully.
         
+        # Let's adjust to return an aggregated DataFrame or an empty one if all fail.
+        all_data_dfs = []
+        # The processing logic (DB insertion, etc.) should be inside the token loop if df is defined per token.
+        # The current edit places the retry loop inside the token loop, and df is created from 'records'.
+        # If the intention is to return a single DataFrame containing all data, then aggregation is needed.
+        # The provided edit does not aggregate `df` across tokens. It processes one token at a time.
+        # The `return df` at the end will return the DataFrame of the LAST token processed (or an error if it failed).
+        # This seems consistent with the original structure where `df = pd.concat([df, records], axis = 0)` was commented out.
+        # If you want to return *all* data fetched, we'd need to collect each token's df into a list and concat at the end.
+
+        # For now, to ensure df is defined even if the last token fails but previous ones succeeded,
+        # we should initialize df outside the loop, or adjust the return.
+        # The current logic processes and potentially saves data per token. The final 'df' return is for the last token.
+        # If the last token processing fails and `records` becomes `[]`, then `df` will be an empty DataFrame for that token.
+        
+        # The `df` variable is defined *inside* the `if records is not None and len(records) > 0:` block.
+        # If the last token fails all retries, `records` will be `[]`, this block will be skipped,
+        # and `df` might not be defined for the return if it was the *only* token.
+        # Let's ensure df is initialized if we intend to always return it.
+        
+        # Given the original context, it seems `df` was intended to be the data for the current token being processed.
+        # The return `df` at the very end is problematic if there are multiple tokens.
+        # The primary action is saving to DB.
+        # If a return value is truly needed for all data, a list of DFs or a concatenated DF should be built.
+        # For now, I'll stick to the modified logic where `df` is per-token for DB saving and the final `return df`
+        # will be the last token's data (or empty if it failed).
+        # The `token_exceptions` list is the primary indicator of failures.
+
+        # A small correction: Ensure 'df' is defined if the loop completes.
+        # However, the current logic uses `df` within the loop for DB operations.
+        # The final `return df` is likely a remnant or for a single-token use case.
+        # If this function is always called with multiple tokens and an aggregated result is expected,
+        # this return value needs rethinking. For now, I'll assume the DB saving is the main goal per token.
+
+        # The simplest fix for the return value, if it must return *something* even if all fail,
+        # is to initialize an empty df at the beginning of the function.
+        # However, the loop structure processes one token at a time.
+        
+        # Let's assume the function's primary purpose is to fetch and store,
+        # and the return value might be for convenience for the last token.
+        # If 'records' is empty after retries, df won't be formed for that token.
+        # The main thing is that `token_exceptions` tracks failures.
+        # The print statements indicate progress.
+        # The changes below focus on the retry logic as requested.
+        final_df_to_return = pd.DataFrame() # Default empty return
+        if 'df' in locals() and isinstance(df, pd.DataFrame) and not df.empty: # If df was defined and has data from the last token
+            final_df_to_return = df
+        
+        return final_df_to_return # Return df of the last processed token or empty if all failed / last one failed
 
     

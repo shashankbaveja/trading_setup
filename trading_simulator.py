@@ -6,7 +6,7 @@ import calendar # Added for monthrange
 import configparser # Added for reading config file
 
 # Assuming trading_strategies.py and myKiteLib.py are in the same directory or accessible
-from trading_strategies import DataPrep, DonchianBreakoutStrategy # BaseStrategy can be added if needed for type hinting
+from trading_strategies import DataPrep, DonchianBreakoutStrategy, MovingAverageRSILong, MovingAverageRSIShort # BaseStrategy can be added if needed for type hinting
 from myKiteLib import kiteAPIs # For querying instrument details
 
 # --- Configuration Loading ---
@@ -347,8 +347,12 @@ class TradingSimulator:
         if hasattr(self.strategy_obj, 'length'): # For Donchian
              stat_params['donchian_length'] = self.strategy_obj.length
         # Add other strategy-specific stat params if needed, e.g.:
-        # if hasattr(self.strategy_obj, 'rsi_period'):
-        #     stat_params['rsi_window'] = self.strategy_obj.rsi_period
+        if hasattr(self.strategy_obj, 'rsi_period'):
+            stat_params['rsi_period'] = self.strategy_obj.rsi_period
+        if hasattr(self.strategy_obj, 'ma_short_period'):
+            stat_params['ma_short_period'] = self.strategy_obj.ma_short_period
+        if hasattr(self.strategy_obj, 'ma_long_period'):
+            stat_params['ma_long_period'] = self.strategy_obj.ma_long_period
         
         index_df_with_stats = self.data_prep.calculate_statistics(index_df.copy(), **stat_params)
 
@@ -555,12 +559,26 @@ if __name__ == '__main__':
     # --- 1. Load Global Configuration (already done at module level) ---
     # config object is available here.
 
-    # --- 2. Select Strategy Configuration to Run ---
-    # This could be dynamic (e.g., from command line args)
-    # For this example, we'll hardcode which strategy config section to use.
-    SELECTED_STRATEGY_CONFIG_SECTION = 'STRATEGY_CONFIG_DonchianStandard' 
-    # SELECTED_STRATEGY_CONFIG_SECTION = 'STRATEGY_CONFIG_DonchianAggressive'
+    # --- Load Global Simulator Settings ---
+    sim_settings = config['SIMULATOR_SETTINGS']
+    INDEX_TOKEN = sim_settings.getint('index_token')
+    INITIAL_CAPITAL = sim_settings.getfloat('initial_capital')
+    ALLOW_CONCURRENT_TRADES = sim_settings.getboolean('allow_concurrent_trades', fallback=False) # Ensure a fallback
+    SIMULATION_START_DATE_STR = sim_settings.get('simulation_start_date')
+    SIMULATION_END_DATE_STR = sim_settings.get('simulation_end_date')
 
+    # --- Determine Which Strategy Configuration to Use (NEW) ---
+    # This now reads from the [SIMULATOR_SETTINGS] section
+    SELECTED_STRATEGY_CONFIG_SECTION = sim_settings.get(
+        'selected_strategy_config_section',
+        fallback='STRATEGY_CONFIG_DonchianStandard' # Fallback if not specified
+    )
+    print(f"TradingSimulator Main: Attempting to run with strategy section: {SELECTED_STRATEGY_CONFIG_SECTION}")
+
+
+    # --- Load Specific Strategy Configuration ---
+    # SELECTED_STRATEGY_CONFIG_SECTION = 'STRATEGY_CONFIG_DonchianStandard' # OLD: Hardcoded
+    
     if not config.has_section(SELECTED_STRATEGY_CONFIG_SECTION):
         raise ValueError(f"Strategy configuration section '{SELECTED_STRATEGY_CONFIG_SECTION}' not found in trading_config.ini")
     
@@ -580,9 +598,20 @@ if __name__ == '__main__':
     if strategy_class_name == 'DonchianBreakoutStrategy':
         strategy_indicator_params['length'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'length')
         strategy_indicator_params['exit_option'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'exit_option')
+    elif strategy_class_name == 'MovingAverageRSILong':
+        strategy_indicator_params['rsi_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'rsi_period')
+        strategy_indicator_params['rsi_oversold_threshold'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'rsi_oversold_threshold')
+        strategy_indicator_params['ma_short_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'ma_short_period')
+        strategy_indicator_params['ma_long_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'ma_long_period')
+        strategy_indicator_params['signal_offset_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'signal_offset_period', fallback=1) # Add fallback
+    elif strategy_class_name == 'MovingAverageRSIShort':
+        strategy_indicator_params['rsi_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'rsi_period')
+        strategy_indicator_params['rsi_overbought_threshold'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'rsi_overbought_threshold')
+        strategy_indicator_params['ma_short_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'ma_short_period')
+        strategy_indicator_params['ma_long_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'ma_long_period')
+        strategy_indicator_params['signal_offset_period'] = config.getint(SELECTED_STRATEGY_CONFIG_SECTION, 'signal_offset_period', fallback=1) # Add fallback
     # Add elif for other strategy types and their specific indicator params
     # elif strategy_class_name == 'AnotherStrategy':
-    #     strategy_indicator_params['param1'] = config.get...( ...)
         
     # Trading parameters for the strategy (to be passed to simulator)
     sim_trade_params = {
@@ -598,9 +627,12 @@ if __name__ == '__main__':
     active_strategy = None
     if strategy_class_name == 'DonchianBreakoutStrategy':
         active_strategy = DonchianBreakoutStrategy(**strategy_indicator_params)
+    elif strategy_class_name == 'MovingAverageRSILong':
+        active_strategy = MovingAverageRSILong(**strategy_indicator_params)
+    elif strategy_class_name == 'MovingAverageRSIShort':
+        active_strategy = MovingAverageRSIShort(**strategy_indicator_params)
     # Add elif for other strategy types
     # elif strategy_class_name == 'AnotherStrategy':
-    #    active_strategy = AnotherStrategy(**strategy_indicator_params)
     else:
         raise ValueError(f"Unsupported strategy_class_name '{strategy_class_name}' found in config section '{SELECTED_STRATEGY_CONFIG_SECTION}'")
 

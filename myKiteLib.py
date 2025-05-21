@@ -335,6 +335,74 @@ class OrderPlacement(system_initialization):
         except Exception as e:
             print(f"OrderPlacement: A general error occurred fetching trades for order ID {order_id}: {e}")
         return None
+    
+    def get_ltp_live(self, instrument_token: int) -> float | None:
+        """
+        Fetches the Last Traded Price (LTP) for a given instrument token.
+        Uses the exchange prefix NFO: as these are typically NFO option tokens.
+        Args:
+            instrument_token (int): The instrument token.
+        Returns:
+            float: The LTP if successful, None otherwise.
+        """
+        # KiteConnect's ltp method can take a list of instrument tokens directly (as int)
+        # or strings like "EXCHANGE:TRADINGSYMBOL".
+        # For NFO options, the integer token is usually sufficient.
+        # The response is a dictionary where keys are "exchange:tradingsymbol" or the token string,
+        # and values are dicts containing 'last_price'.
+        
+        # We need to construct the key that Kite API will return in the LTP dictionary.
+        # This can be tricky if we only have the token.
+        # A common format is 'NFO:TOKEN_AS_STRING' or just the token itself if it's an int list.
+        # Let's try with the integer token first, as it's simpler.
+        # The API expects a list of instrument tokens or instrument names.
+        # Example: kite.ltp([123456, 789012]) or kite.ltp(["NFO:NIFTY23JUL18000CE", "NSE:RELIANCE"])
+
+        try:
+            # Ensure the kite session is initialized (it should be by OrderPlacement's __init__)
+            if not self.kite:
+                self.logger.error("OrderPlacement: Kite object not initialized for LTP fetch.")
+                return None
+
+            ltp_data = self.kite.ltp([instrument_token]) # Pass as a list
+            # self.logger.debug(f"LTP raw response for {instrument_token}: {ltp_data}")
+
+            if ltp_data and str(instrument_token) in ltp_data: # LTP keys are strings of tokens
+                # The key in the response dictionary is the string representation of the instrument token
+                # when a list of integer tokens is passed.
+                token_data = ltp_data[str(instrument_token)]
+                if token_data and 'last_price' in token_data:
+                    ltp_value = float(token_data['last_price'])
+                    # self.logger.debug(f"OrderPlacement: LTP for token {instrument_token}: {ltp_value}")
+                    return ltp_value
+                else:
+                    self.logger.warning(f"OrderPlacement: 'last_price' not in LTP response for token {instrument_token}. Data: {token_data}")
+            elif ltp_data:
+                # Fallback: If the key is not the direct string of the token,
+                # it might be because the API sometimes returns keys with exchange prefix.
+                # This part is more complex as we don't have the exact tradingsymbol here.
+                # For now, we rely on the direct token key.
+                # Example: Check if any key in ltp_data corresponds to our token if it has an exchange prefix
+                for key, value_dict in ltp_data.items():
+                    if isinstance(value_dict, dict) and value_dict.get('instrument_token') == instrument_token:
+                        if 'last_price' in value_dict:
+                            ltp_value = float(value_dict['last_price'])
+                            # self.logger.debug(f"OrderPlacement: LTP for token {instrument_token} (found via key {key}): {ltp_value}")
+                            return ltp_value
+                        else:
+                            self.logger.warning(f"OrderPlacement: 'last_price' not in LTP response for token {instrument_token} (key {key}). Data: {value_dict}")
+                            return None # Found the token but no last_price
+
+                self.logger.warning(f"OrderPlacement: LTP data received, but token {instrument_token} not found directly or via iteration. LTP Data: {ltp_data}")
+
+            else:
+                self.logger.warning(f"OrderPlacement: No LTP data returned for token {instrument_token}. Response: {ltp_data}")
+        except KiteException as e:
+            self.logger.error(f"OrderPlacement: Kite API error fetching LTP for token {instrument_token}: {e}", exc_info=False) # exc_info=False to avoid too much noise for frequent calls
+        except Exception as e:
+            self.logger.error(f"OrderPlacement: General error fetching LTP for token {instrument_token}: {e}", exc_info=False)
+        return None
+    
 
 class kiteAPIs:
     def __init__(self):
@@ -484,6 +552,7 @@ class kiteAPIs:
         return final_df
 
     ## get data from kite API for a given token, from_date, to_date, interval
+
     def getHistoricalData(self, from_date, to_date, tokens, interval):
         # embed()
         if from_date > to_date:

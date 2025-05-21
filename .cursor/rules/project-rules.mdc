@@ -14,6 +14,7 @@ I want to build multiple strategies with a lot of technical indicators and predi
 we will work in the following virtual environment.
 /opt/anaconda3/bin/activate && conda activate /opt/anaconda3/envs/KiteConnect
 
+WHEN ASKED TO ADD A NEW STRATEGY, YOU CAN ONLY 'ADD' TO THE EXISTING FILE. DO NOT OVERWTIRE OR CHANGE THE EXISTING STATISTICS OR EXISTING STARTEGY. REST OF THE FILE IS FULLY FUNCTIONAL, MAINTAIN ITS FUNCTIONALITY
 
 DOCUMENTATION IS IMPORTANT
 use docs/implementation.md file to track and update the progress with details around the implementation

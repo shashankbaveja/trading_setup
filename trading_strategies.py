@@ -151,14 +151,20 @@ class DataPrep:
         print(f"DataPrep: Data preparation complete for interval '{interval}'. Final shape: {final_df.shape}")
         return final_df
 
-    def calculate_statistics(self, data: pd.DataFrame, donchian_length: int = -1) -> pd.DataFrame:
+    def calculate_statistics(self, data: pd.DataFrame, donchian_length: int = -1, rsi_period: int = -1, ma_short_period: int = -1, ma_long_period: int = -1) -> pd.DataFrame:
         """
         Calculates a standard set of technical indicators and adds them to the DataFrame.
-        Currently calculates Donchian Channels.
+        Currently calculates Donchian Channels, RSI, and Moving Averages.
 
         Args:
             data: DataFrame with OHLCV data.
             donchian_length: The lookback period for the Donchian Channel. 
+                             If -1, tries to load from config or uses a hardcoded fallback.
+            rsi_period: The lookback period for the RSI indicator.
+                        If -1, tries to load from config or uses a hardcoded fallback.
+            ma_short_period: The lookback period for the short-term Moving Average.
+                             If -1, tries to load from config or uses a hardcoded fallback.
+            ma_long_period: The lookback period for the long-term Moving Average.
                              If -1, tries to load from config or uses a hardcoded fallback.
 
         Returns:
@@ -217,6 +223,67 @@ class DataPrep:
         df['don_lower_prev'] = df['don_lower'].shift(1)
         df['don_basis_prev'] = df['don_basis'].shift(1)
         
+        # --- ADD NEW INDICATORS START ---
+
+        # Resolve RSI Period
+        if rsi_period == -1:
+            resolved_rsi_period = config.getint('DATA_PREP_DEFAULTS', 'default_rsi_period_for_dp', fallback=14)
+        else:
+            resolved_rsi_period = rsi_period
+        if not isinstance(resolved_rsi_period, int) or resolved_rsi_period <= 0:
+            print("DataPrep Warning: RSI period must be a positive integer. Using fallback 14.")
+            resolved_rsi_period = 14
+            
+        # Resolve MA Short Period
+        if ma_short_period == -1:
+            resolved_ma_short_period = config.getint('DATA_PREP_DEFAULTS', 'default_ma_short_period_for_dp', fallback=5)
+        else:
+            resolved_ma_short_period = ma_short_period
+        if not isinstance(resolved_ma_short_period, int) or resolved_ma_short_period <= 0:
+            print("DataPrep Warning: MA Short period must be a positive integer. Using fallback 5.")
+            resolved_ma_short_period = 5
+
+        # Resolve MA Long Period
+        if ma_long_period == -1:
+            resolved_ma_long_period = config.getint('DATA_PREP_DEFAULTS', 'default_ma_long_period_for_dp', fallback=200)
+        else:
+            resolved_ma_long_period = ma_long_period
+        if not isinstance(resolved_ma_long_period, int) or resolved_ma_long_period <= 0:
+            print("DataPrep Warning: MA Long period must be a positive integer. Using fallback 200.")
+            resolved_ma_long_period = 200
+
+        # Calculate RSI using ta library if period is valid
+        if resolved_rsi_period > 0 and 'close' in df.columns and not df['close'].empty:
+            from ta.momentum import RSIIndicator # Import here
+            print(f"DataPrep: - RSI (period {resolved_rsi_period})")
+            rsi_indicator = RSIIndicator(close=df['close'], window=resolved_rsi_period, fillna=False)
+            df['rsi'] = rsi_indicator.rsi()
+            df['rsi_prev'] = df['rsi'].shift(1)
+        else:
+            print(f"DataPrep: Skipping RSI calculation (period: {resolved_rsi_period}, data valid: {'close' in df.columns and not df['close'].empty})")
+
+        # Calculate Short-term Moving Average using ta library if period is valid
+        if resolved_ma_short_period > 0 and 'close' in df.columns and not df['close'].empty:
+            from ta.trend import SMAIndicator # Import here
+            print(f"DataPrep: - Short MA (period {resolved_ma_short_period})")
+            sma_short_indicator = SMAIndicator(close=df['close'], window=resolved_ma_short_period, fillna=False)
+            df['ma_short'] = sma_short_indicator.sma_indicator()
+            df['ma_short_prev'] = df['ma_short'].shift(1)
+        else:
+            print(f"DataPrep: Skipping Short MA calculation (period: {resolved_ma_short_period}, data valid: {'close' in df.columns and not df['close'].empty})")
+
+        # Calculate Long-term Moving Average using ta library if period is valid
+        if resolved_ma_long_period > 0 and 'close' in df.columns and not df['close'].empty:
+            from ta.trend import SMAIndicator # Import here
+            print(f"DataPrep: - Long MA (period {resolved_ma_long_period})")
+            sma_long_indicator = SMAIndicator(close=df['close'], window=resolved_ma_long_period, fillna=False)
+            df['ma_long'] = sma_long_indicator.sma_indicator()
+            df['ma_long_prev'] = df['ma_long'].shift(1)
+        else:
+            print(f"DataPrep: Skipping Long MA calculation (period: {resolved_ma_long_period}, data valid: {'close' in df.columns and not df['close'].empty})")
+        
+        # --- ADD NEW INDICATORS END ---
+
         # TODO: Add other common indicators here as needed for other strategies (RSI, BBands, ADX, etc.)
         # Example for RSI (uncomment and adapt if needed later):
         # from ta.momentum import RSIIndicator
@@ -338,6 +405,132 @@ class DonchianBreakoutStrategy(BaseStrategy):
         print(f"{self.strategy_name}: Signals generated.DataFrame shape: {df.shape}")
         print(df['signal'].value_counts())
         
+        return df
+
+class MovingAverageRSILong(BaseStrategy):
+    """
+    Implements a strategy based on RSI(2) and Moving Averages for LONG signals.
+    Long Entry: Close > Long MA AND Close < Short MA AND RSI(2) < Oversold Threshold.
+    """
+    def __init__(self, rsi_period: int = 2, rsi_oversold_threshold: int = 10, 
+                 ma_short_period: int = 5, ma_long_period: int = 200,
+                 signal_offset_period: int = 1): # Default to 1 (no offset)
+        if not all(isinstance(p, int) and p > 0 for p in [rsi_period, ma_short_period, ma_long_period]):
+            raise ValueError("RSI and MA periods must be positive integers.")
+        if not (isinstance(rsi_oversold_threshold, int) and 0 < rsi_oversold_threshold < 100):
+            raise ValueError("RSI oversold threshold must be an integer between 0 and 100.")
+        if not (isinstance(signal_offset_period, int) and signal_offset_period >= 1):
+            raise ValueError("Signal offset period must be an integer greater than or equal to 1.")
+
+        self.rsi_period = rsi_period
+        self.rsi_oversold_threshold = rsi_oversold_threshold
+        self.ma_short_period = ma_short_period
+        self.ma_long_period = ma_long_period
+        self.signal_offset_period = signal_offset_period
+        self.strategy_name = f"MARSI_Long_R{self.rsi_period}_T{self.rsi_oversold_threshold}_S{self.ma_short_period}_L{self.ma_long_period}_O{self.signal_offset_period}"
+        print(f"Initialized {self.strategy_name}")
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        required_cols = ['close', 'rsi_prev', 'ma_short_prev', 'ma_long_prev']
+        if not all(col in data.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in data.columns]
+            raise ValueError(f"Input DataFrame for {self.strategy_name} is missing columns: {missing}")
+
+        df = data.copy()
+        df['signal'] = 0
+        df['raw_signal'] = False # Helper column for raw condition
+
+        # Calculate raw entry condition
+        raw_long_entry_condition = (
+            (df['close'] > df['ma_long_prev']) &
+            (df['close'] < df['ma_short_prev']) &
+            (df['rsi_prev'] < self.rsi_oversold_threshold)
+        )
+        df.loc[raw_long_entry_condition, 'raw_signal'] = True
+
+        # Calculate consecutive raw signals
+        df['consecutive_raw_signals'] = 0
+        consecutive_count = 0
+        for i in range(len(df)):
+            if df.loc[i, 'raw_signal']:
+                consecutive_count += 1
+            else:
+                consecutive_count = 0
+            df.loc[i, 'consecutive_raw_signals'] = consecutive_count
+        
+        # Generate final signal based on offset
+        final_long_entry_condition = (df['raw_signal']) & (df['consecutive_raw_signals'] == self.signal_offset_period)
+        df.loc[final_long_entry_condition, 'signal'] = 1
+
+        df['signal'] = df['signal'].fillna(0).astype(int)
+        # Drop helper columns if not needed for debugging output
+        # df.drop(columns=['raw_signal', 'consecutive_raw_signals'], inplace=True)
+        print(f"{self.strategy_name}: Signals generated. DataFrame shape: {df.shape}")
+        print(df['signal'].value_counts())
+        return df
+
+class MovingAverageRSIShort(BaseStrategy):
+    """
+    Implements a strategy based on RSI(2) and Moving Averages for SHORT signals.
+    Short Entry: Close < Long MA AND Close > Short MA AND RSI(2) > Overbought Threshold.
+    (Signal is 1, option_type=PE in config will make it a short trade)
+    """
+    def __init__(self, rsi_period: int = 2, rsi_overbought_threshold: int = 90, 
+                 ma_short_period: int = 5, ma_long_period: int = 200,
+                 signal_offset_period: int = 1): # Default to 1 (no offset)
+        if not all(isinstance(p, int) and p > 0 for p in [rsi_period, ma_short_period, ma_long_period]):
+            raise ValueError("RSI and MA periods must be positive integers.")
+        if not (isinstance(rsi_overbought_threshold, int) and 0 < rsi_overbought_threshold < 100):
+            raise ValueError("RSI overbought threshold must be an integer between 0 and 100.")
+        if not (isinstance(signal_offset_period, int) and signal_offset_period >= 1):
+            raise ValueError("Signal offset period must be an integer greater than or equal to 1.")
+
+        self.rsi_period = rsi_period
+        self.rsi_overbought_threshold = rsi_overbought_threshold
+        self.ma_short_period = ma_short_period
+        self.ma_long_period = ma_long_period
+        self.signal_offset_period = signal_offset_period
+        self.strategy_name = f"MARSI_Short_R{self.rsi_period}_T{self.rsi_overbought_threshold}_S{self.ma_short_period}_L{self.ma_long_period}_O{self.signal_offset_period}"
+        print(f"Initialized {self.strategy_name}")
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        required_cols = ['close', 'rsi_prev', 'ma_short_prev', 'ma_long_prev']
+        if not all(col in data.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in data.columns]
+            raise ValueError(f"Input DataFrame for {self.strategy_name} is missing columns: {missing}")
+
+        df = data.copy()
+        df['signal'] = 0
+        df['raw_signal'] = False # Helper column for raw condition
+
+        # Calculate raw entry condition
+        # For shorting, we generate a BUY signal (1) which the simulator will use to buy a PE option.
+        raw_short_entry_condition = (
+            (df['close'] < df['ma_long_prev']) &
+            (df['close'] > df['ma_short_prev']) &
+            (df['rsi_prev'] > self.rsi_overbought_threshold)
+        )
+        df.loc[raw_short_entry_condition, 'raw_signal'] = True
+
+        # Calculate consecutive raw signals
+        df['consecutive_raw_signals'] = 0
+        consecutive_count = 0
+        for i in range(len(df)):
+            if df.loc[i, 'raw_signal']:
+                consecutive_count += 1
+            else:
+                consecutive_count = 0
+            df.loc[i, 'consecutive_raw_signals'] = consecutive_count
+
+        # Generate final signal based on offset
+        final_short_entry_condition = (df['raw_signal']) & (df['consecutive_raw_signals'] == self.signal_offset_period)
+        df.loc[final_short_entry_condition, 'signal'] = 1 # Signal 1, simulator buys PE for short
+
+        df['signal'] = df['signal'].fillna(0).astype(int)
+        # Drop helper columns if not needed for debugging output
+        # df.drop(columns=['raw_signal', 'consecutive_raw_signals'], inplace=True)
+        print(f"{self.strategy_name}: Signals generated. DataFrame shape: {df.shape}")
+        print(df['signal'].value_counts())
         return df
 
 if __name__ == '__main__':

@@ -595,10 +595,48 @@ class LiveTrader:
         self.logger.info(f"Active trade details cleared. Reason: {exit_reason}, Exit Price: {exit_price}")
 
     def _get_last_option_candle(self, option_token):
-        # This method needs to be implemented to fetch the last candle for a given option
-        # It should return a dictionary with 'low' and 'high' keys representing the last candle's low and high prices
-        # This is a placeholder and should be replaced with the actual implementation
-        return None
+        try:
+            today_str = date.today().strftime('%Y-%m-%d')
+            # Fetch data for the last few minutes to ensure we get the latest completed candle
+            # Kite historical data might have a slight delay for the absolute latest tick.
+            # Fetching 2 candles and taking the second to last [-2] or last [-1] depending on timing.
+            # For live monitoring, it's often best to get a slightly larger window if issues arise.
+            from_datetime = datetime.now() - timedelta(minutes=5) # Fetch last 5 mins of data
+            to_datetime = datetime.now()
+
+            # Ensure from_date and to_date are strings in 'YYYY-MM-DD HH:MM:SS' format if API expects that,
+            # or use date objects if API expects that. kite.historical_data uses date strings for from_date/to_date
+            # and datetime objects for specific time ranges if supported.
+            # For minute data for "today", from_date and to_date are usually the same date.
+
+            # The Kite API historical_data takes 'from_date' and 'to_date' as YYYY-MM-DD strings.
+            # It doesn't directly support fetching a time range within a day for 'minute' data across different days.
+            # So, we fetch for 'today' and then filter by time if needed, or rely on getting the last few candles.
+
+            option_data = self.order_manager.kite.historical_data(
+                instrument_token=option_token,
+                from_date=today_str, # Current day
+                to_date=today_str,   # Current day
+                interval='minute' 
+            )
+
+            if option_data and isinstance(option_data, list) and len(option_data) > 0:
+                # The last element in the list is the most recent candle
+                last_candle = option_data[-1]
+                # Ensure it's a dictionary and has the required keys
+                if isinstance(last_candle, dict) and 'low' in last_candle and 'high' in last_candle and 'date' in last_candle:
+                    # Log the timestamp of the candle being used
+                    self.logger.debug(f"Last option candle for token {option_token} at {last_candle['date']}: Low={last_candle['low']}, High={last_candle['high']}")
+                    return {'low': last_candle['low'], 'high': last_candle['high'], 'date': last_candle['date']}
+                else:
+                    self.logger.warning(f"Last candle for {option_token} is not in expected format: {last_candle}")
+                    return None
+            else:
+                self.logger.warning(f"No historical data returned for option token {option_token} for today.")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error fetching last option candle for token {option_token}: {e}", exc_info=True)
+            return None
 
 
 # --- Main Execution --- #

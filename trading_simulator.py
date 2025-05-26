@@ -81,28 +81,33 @@ class TradingSimulator:
         # However, ensure self.k_apis.startKiteSession.con is correctly managed.
         print(f"\nAttempting to find closest CE option for NIFTY price {underlying_price_at_signal:.2f} at {signal_datetime}")
         
+        # query = """
+        # WITH last_expiry_month AS (
+        #     SELECT MAX(expiry) AS last_expiry_month
+        #     FROM kiteConnect.instruments_zerodha
+        #     WHERE name = 'NIFTY'
+        #       AND instrument_type = 'CE'
+        #       AND EXTRACT(MONTH FROM expiry) = EXTRACT(MONTH FROM %(signal_date)s)
+        #       AND EXTRACT(YEAR FROM expiry) = EXTRACT(YEAR FROM %(signal_date)s)
+        # ),
+        # filtered_options AS (
+        #     SELECT a.instrument_token, a.strike,
+        #            ROW_NUMBER() OVER (ORDER BY a.strike ASC) AS rnum
+        #     FROM kiteConnect.instruments_zerodha a
+        #     INNER JOIN last_expiry_month b ON a.expiry = b.last_expiry_month
+        #     WHERE a.name = 'NIFTY'
+        #       AND a.instrument_type = 'CE'
+        #       AND a.strike >= %(strike_price)s
+        # )
+        # SELECT instrument_token
+        # FROM filtered_options 
+        # WHERE rnum = 1;
+        # """
+
         query = """
-        WITH last_expiry_month AS (
-            SELECT MAX(expiry) AS last_expiry_month
-            FROM kiteConnect.instruments_zerodha
-            WHERE name = 'NIFTY'
-              AND instrument_type = 'CE'
-              AND EXTRACT(MONTH FROM expiry) = EXTRACT(MONTH FROM %(signal_date)s)
-              AND EXTRACT(YEAR FROM expiry) = EXTRACT(YEAR FROM %(signal_date)s)
-        ),
-        filtered_options AS (
-            SELECT a.instrument_token, a.strike,
-                   ROW_NUMBER() OVER (ORDER BY a.strike ASC) AS rnum
-            FROM kiteConnect.instruments_zerodha a
-            INNER JOIN last_expiry_month b ON a.expiry = b.last_expiry_month
-            WHERE a.name = 'NIFTY'
-              AND a.instrument_type = 'CE'
-              AND a.strike >= %(strike_price)s
-        )
-        SELECT instrument_token
-        FROM filtered_options 
-        WHERE rnum = 1;
+        SELECT 256265 as instrument_token;
         """
+
         selected_token: int | None = None
         conn = None
         try:
@@ -255,18 +260,38 @@ class TradingSimulator:
             current_option_close = current_candle_data['close']
             current_option_candle_time = current_candle_data['date']
 
-            # Priority 1: Check for NIFTY Strategy Exit Signal
+            # Check for NIFTY strategy exit signal
             if nifty_signals_for_trade_window is not None:
-                # Ensure current_option_candle_time is in the index of nifty_signals_for_trade_window
-                # This assumes nifty_signals_for_trade_window is a Series indexed by datetime
-                if current_option_candle_time in nifty_signals_for_trade_window.index:
-                    underlying_signal = nifty_signals_for_trade_window.get(current_option_candle_time)
-                    if underlying_signal == -1:
-                        option_exit_price = current_option_close # Exit at close of this candle
-                        option_exit_time = current_option_candle_time
-                        exit_reason = "Strategy Exit Signal"
-                        print(f"    TradeSim: Exiting due to NIFTY Strategy Signal at {current_option_candle_time}")
-                        break
+                # current_nifty_signal_time should be the time of the current_candle_data, 
+                # as nifty_signals_for_trade_window is indexed by NIFTY's candle times.
+                current_nifty_signal_time_for_lookup = current_candle_data['date'] 
+                if current_nifty_signal_time_for_lookup in nifty_signals_for_trade_window.index:
+                    nifty_exit_signal_value = nifty_signals_for_trade_window.loc[current_nifty_signal_time_for_lookup]
+                    if nifty_exit_signal_value == -1: # NIFTY Exit Signal
+                        # Try to exit at the open of the next candle
+                        next_option_candle_positional_idx = current_option_candle_positional_idx + 1
+                        if next_option_candle_positional_idx < len(option_ohlcv_df):
+                            next_option_candle = option_ohlcv_df.iloc[next_option_candle_positional_idx]
+                            if pd.notna(next_option_candle['open']) and next_option_candle['open'] > 0:
+                                exit_reason = "NIFTY Strategy Exit Signal (at next open)"
+                                option_exit_price = next_option_candle['open']
+                                option_exit_time = next_option_candle['date']
+                                print(f"    TradeSim: Exiting due to NIFTY Strategy Signal at {current_nifty_signal_time_for_lookup}, option exit at next open {option_exit_time}")
+                                break
+                            else:
+                                # If next open is invalid, fall back to current close
+                                exit_reason = "NIFTY Strategy Exit Signal (next open invalid, used current close)"
+                                option_exit_price = current_candle_data['close']
+                                option_exit_time = current_candle_data['date']
+                                print(f"    TradeSim: Exiting due to NIFTY Strategy Signal at {current_nifty_signal_time_for_lookup}, next option open invalid, using current close {option_exit_time}")
+                                break
+                        else:
+                            # If no next candle, exit at current close
+                            exit_reason = "NIFTY Strategy Exit Signal (no next candle, used current close)"
+                            option_exit_price = current_candle_data['close']
+                            option_exit_time = current_candle_data['date']
+                            print(f"    TradeSim: Exiting due to NIFTY Strategy Signal at {current_nifty_signal_time_for_lookup}, no next option candle, using current close {option_exit_time}")
+                            break
             
             # Priority 2: Check for profit target
             if current_option_high >= profit_target_price:
